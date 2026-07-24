@@ -17,5 +17,17 @@
       "v1.1.0": "增加配置面板、运行状态页、快捷操作按钮、日志查看",
       "v1.0.0": "初始版本"
     }
+  },
+  "EmbyActorEnhanceLocal": {
+    "name": "Emby角色同步增强（本地版）",
+    "description": "同步豆瓣中文演员和角色到电视剧、季及每集，并按配置刷新单集元数据。",
+    "labels": "媒体服务器,元数据",
+    "version": "1.1.2-local",
+    "icon": "https://raw.githubusercontent.com/xiaoQQya/MoviePilot-Plugins/refs/heads/main/icons/actor.png",
+    "author": "xiaoQQya, local",
+    "level": 1,
+    "history": {
+      "v1.1.0-local": "新增逐集同步中文演职人员、单集非递归刷新和覆盖策略。"
+    }
   }
 }

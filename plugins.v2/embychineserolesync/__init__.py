@@ -31,7 +31,7 @@ class EmbyChineseRoleSync(_PluginBase):
     # 插件描述
     plugin_desc = "同步豆瓣中文演员与角色到电视剧/季/集，支持媒体库白名单过滤与手动精准同步。"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/xiaoQQya/MoviePilot-Plugins/refs/heads/main/icons/actor.png"
+    plugin_icon = "mediaplay.png"
     # 插件版本
     plugin_version = "1.8.3"
     # 插件作者

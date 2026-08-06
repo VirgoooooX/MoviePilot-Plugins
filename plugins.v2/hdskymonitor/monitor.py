@@ -3,8 +3,9 @@ import logging
 from datetime import datetime
 from typing import Callable, List, Optional
 from .downloader import download_torrent_direct
+from .library import check_library_complete
 from .matcher import is_full_season, is_recent, torrent_id_key
-from .metadata import get_backdrop_url, get_poster_url
+from .metadata import get_backdrop_url, recognize_tmdb_media
 from .site import search_page
 from .state import MonitorState
 
@@ -29,13 +30,30 @@ def build_torrent_text(item: dict) -> str:
 
 class HdskyMonitorRunner:
     """编排天空资源扫描、下载、历史和通知。"""
-    def __init__(self, state_path: str, notifier=None, history_callback=None):
-        self.state=MonitorState(state_path); self.notifier=notifier; self.history_callback=history_callback
+    def __init__(self, state_path: str, notifier=None, history_callback=None, log_callback=None):
+        """初始化监控流程及通知、历史和独立日志回调。"""
+        self.state=MonitorState(state_path); self.notifier=notifier; self.history_callback=history_callback; self.log_callback=log_callback
 
-    def run(self, test_mode=False, max_pages=1, days=2, limit=0, save_path=None):
-        """执行一次监控并返回成功下载数。"""
-        logger.info("天空种子监控启动")
-        state=self.state.load(); processed=set(state.get("processed", [])); matched=[]; scanned=0
+    def _log(self, level: str, message: str, *args) -> None:
+        """同时写入 MoviePilot 主日志和插件独立日志。"""
+        getattr(logger, level)(message, *args)
+        if self.log_callback:
+            rendered = message % args if args else message
+            self.log_callback(level, rendered)
+
+    def run(
+        self,
+        test_mode=False,
+        max_pages=1,
+        days=2,
+        limit=0,
+        save_path="/downloadssd/local/",
+        downloader=None,
+        check_library=True,
+    ):
+        """使用指定下载路径和下载器执行一次监控。"""
+        self._log("info", "天空种子监控启动")
+        state=self.state.load(); processed=set(state.get("processed", [])); matched=[]; skipped=[]; scanned=0
         for page in range(1, max_pages + 1):
             results=search_page(page)
             if not results: break
@@ -45,24 +63,63 @@ class HdskyMonitorRunner:
                 scanned += 1
                 if is_full_season(ti.get("title", ""), ti.get("description", "")):
                     matched.append({"item": item, "key": key})
-        logger.info("扫描 %s 条, 匹配 %s 条", scanned, len(matched))
+        self._log("info", "扫描 %s 条, 匹配 %s 条", scanned, len(matched))
         if test_mode:
             for row in matched:
-                ti=row["item"]["torrent_info"]; logger.info("  • %s (%s, 🌱%s)", ti.get("title"), format_size(ti.get("size",0)), ti.get("seeders",0))
+                ti=row["item"]["torrent_info"]; self._log("info", "  • %s (%s, 🌱%s)", ti.get("title"), format_size(ti.get("size",0)), ti.get("seeders",0))
             return 0
         downloaded=[]
         for row in matched:
+            item=row["item"]; ti=item["torrent_info"]; mi=item["meta_info"]
+            try:
+                recognized = recognize_tmdb_media(ti.get("title", ""), ti.get("description", ""))
+            except Exception as exc:
+                self._log("warning", "TMDB 识别失败，将使用种子解析名称：%s", exc)
+                recognized = {}
+            if recognized.get("title"):
+                mi["cn_name"] = recognized["title"]
+                mi["name"] = recognized["title"]
+                mi["year"] = recognized.get("year") or mi.get("year")
+                mi["tmdb_id"] = recognized.get("tmdb_id")
+                mi["backdrop"] = recognized.get("backdrop")
+                mi["poster"] = recognized.get("poster")
+                self._log("info", "TMDB 识别：%s (%s)", mi["cn_name"], mi.get("year") or "未知年份")
+                # 下载前确认媒体库中是否已存在完整媒体，存在则跳过
+                if check_library and recognized.get("tmdb_id"):
+                    exists = check_library_complete(
+                        tmdb_id=recognized.get("tmdb_id"),
+                        media_type=recognized.get("type"),
+                        title=recognized.get("title"),
+                        year=recognized.get("year"),
+                        season=recognized.get("season"),
+                        season_info=recognized.get("season_info"),
+                        number_of_seasons=recognized.get("number_of_seasons") or 0,
+                        number_of_episodes=recognized.get("number_of_episodes") or 0,
+                    )
+                    if exists is True:
+                        self._log("info", "⏭ 媒体库已存在完整媒体，跳过下载：%s (%s)", mi["cn_name"], mi.get("year") or "")
+                        state.setdefault("processed", []).append(row["key"])
+                        skipped.append(row)
+                        continue
+                    if exists is None:
+                        self._log("warning", "媒体库检查不可用，按原逻辑继续下载：%s", mi["cn_name"])
             if limit > 0 and len(downloaded) >= limit: break
             item=row["item"]; ti=item["torrent_info"]; mi=item["meta_info"]; name=mi.get("cn_name") or mi.get("name") or ti.get("title", "")
-            result=download_torrent_direct(ti.get("enclosure", ""), name, ti.get("description", ""), save_path=save_path or "")
+            result=download_torrent_direct(
+                ti.get("enclosure", ""),
+                name,
+                ti.get("description", ""),
+                save_path=save_path or "/downloadssd/local/",
+                downloader=downloader,
+            )
             if result and result.get("success"):
-                state.setdefault("processed", []).append(row["key"]); downloaded.append(row); logger.info("✓ %s", name)
-            else: logger.warning("✗ %s: %s", name, (result or {}).get("message", "请求失败"))
-        if self.history_callback: self.history_callback(matched, downloaded)
+                state.setdefault("processed", []).append(row["key"]); downloaded.append(row); self._log("info", "✓ %s", name)
+            else: self._log("warning", "✗ %s: %s", name, (result or {}).get("message", "请求失败"))
+        if self.history_callback: self.history_callback(matched, downloaded, skipped)
         for row in downloaded:
             item=row["item"]; ti=item["torrent_info"]; mi=item["meta_info"]; name=mi.get("cn_name") or mi.get("name") or ""; year=mi.get("year") or ""
-            poster=get_poster_url(name, year); backdrop=get_backdrop_url(name, year); text=build_torrent_text(item); full_text="🤖 天空脚本自动下载\n\n"+text
+            backdrop=mi.get("backdrop") or get_backdrop_url(name, year); text=build_torrent_text(item)
             if self.notifier:
                 display=f"{name} ({year})" if year else name
-                self.notifier(title=f"🤖 天空自动下载 | {display}", text=full_text, image=poster or backdrop, link=ti.get("page_url"))
-        self.state.save(state); logger.info("完成"); return len(downloaded)
+                self.notifier(title=f"🤖 天空自动下载 | {display}", text=text, image=backdrop, link=ti.get("page_url"))
+        self.state.save(state); self._log("info", "完成"); return len(downloaded)

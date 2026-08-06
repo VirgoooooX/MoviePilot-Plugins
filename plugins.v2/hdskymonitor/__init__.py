@@ -22,9 +22,10 @@ class HdskyMonitor(_PluginBase):
     plugin_name = "天空监控"
     plugin_desc = "定时监控天空站点新发布种子，自动下载并通知"
     plugin_icon = "signin.png"
-    plugin_version = "2.0.0"
+    plugin_version = "2.4.0"
     plugin_label = "站点订阅"
-    plugin_author = "local"
+    plugin_author = "Virgooooox"
+    author_url = "https://github.com/virgooooox"
     plugin_config_prefix = "hdskymonitor_"
     plugin_order = 100
     auth_level = 1
@@ -36,6 +37,9 @@ class HdskyMonitor(_PluginBase):
     _max_pages: int = 5
     _limit: int = 0
     _notify: bool = True
+    _save_path: str = "/downloadssd/local/"
+    _downloader: Optional[str] = None
+    _check_library: bool = True
     _running: bool = False
 
     def init_plugin(self, config: dict = None) -> None:
@@ -49,13 +53,17 @@ class HdskyMonitor(_PluginBase):
             self._max_pages = int(config.get("max_pages", 1))
             self._limit = int(config.get("limit", 0))
             self._notify = bool(config.get("notify", True))
+            self._save_path = str(config.get("save_path") or "/downloadssd/local/").strip()
+            self._downloader = str(config.get("downloader") or "").strip() or None
+            self._check_library = bool(config.get("check_library", True))
 
         if self._enabled:
             logger.info(f"天空监控已启用，计划：{self._cron}")
 
-    def _save_history(self, matched: List[dict], downloaded: List[dict]) -> None:
+    def _save_history(self, matched: List[dict], downloaded: List[dict], skipped: List[dict] = None) -> None:
         """保存天空监控历史匹配记录。"""
         history = self.get_data("history") or []
+        skipped_keys = {row.get("key") for row in (skipped or [])}
         downloaded_keys = {item.get("key") for item in downloaded}
         for raw_item in matched:
             item = raw_item.get("item", raw_item)
@@ -71,6 +79,12 @@ class HdskyMonitor(_PluginBase):
                 poster = get_poster_url(name, year)
             except Exception:
                 poster = None
+            if key in downloaded_keys:
+                status = "success"
+            elif key in skipped_keys:
+                status = "skipped"
+            else:
+                status = "matched"
             history.append({
                 "unique": key,
                 "torrent_id": ti.get("page_url", "").split("id=")[-1].split("&")[0],
@@ -84,10 +98,18 @@ class HdskyMonitor(_PluginBase):
                 "grabs": ti.get("grabs", 0),
                 "pubdate": ti.get("pubdate", ""),
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "status": "success" if any(d.get("item") is item for d in downloaded) else "matched",
+                "status": status,
                 "page_url": ti.get("page_url", ""),
             })
         self.save_data("history", history[-200:])
+
+    @staticmethod
+    def _write_plugin_log(level: str, message: str) -> None:
+        """按插件页面兼容格式追加独立运行日志。"""
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, "a", encoding="utf-8") as log_file:
+            log_file.write(f"【{level.upper()}】{timestamp} - hdsky_monitor - {message}\n")
 
     def _post_monitor_message(self, title: str, text: str, image: str = None, link: str = None) -> None:
         """通过 MoviePilot 统一通知链发送天空监控消息。"""
@@ -111,12 +133,16 @@ class HdskyMonitor(_PluginBase):
                 state_path=STATE_FILE,
                 notifier=None if test_mode or not self._notify else self._post_monitor_message,
                 history_callback=None if test_mode else self._save_history,
+                log_callback=self._write_plugin_log,
             )
             count = runner.run(
                 test_mode=test_mode,
                 max_pages=self._max_pages,
                 days=self._days,
                 limit=self._limit,
+                save_path=self._save_path,
+                downloader=self._downloader,
+                check_library=self._check_library,
             )
             return {"success": True, "output": f"完成，成功下载 {count} 个资源", "error": "", "returncode": 0}
         except Exception as exc:
@@ -261,7 +287,10 @@ class HdskyMonitor(_PluginBase):
                     "days": self._days,
                     "max_pages": self._max_pages,
                     "limit": self._limit,
-                    "notify": self._notify
+                    "notify": self._notify,
+                    "save_path": self._save_path,
+                    "downloader": self._downloader,
+                    "check_library": self._check_library
                 }
             }
         }
@@ -289,7 +318,7 @@ class HdskyMonitor(_PluginBase):
         """构建响应式历史资源卡片。"""
         name = item.get("name") or item.get("title") or "未知资源"
         status = item.get("status") or "matched"
-        status_map = {"success": ("已下载", "success"), "matched": ("已匹配", "info"), "failed": ("失败", "error")}
+        status_map = {"success": ("已下载", "success"), "matched": ("已匹配", "info"), "failed": ("失败", "error"), "skipped": ("已存在", "warning")}
         status_text, status_color = status_map.get(status, (status, "default"))
         meta = " · ".join(filter(None, [str(item.get("year") or ""), item.get("season_episode") or ""]))
         size = item.get("size") or 0
@@ -392,8 +421,11 @@ class HdskyMonitor(_PluginBase):
                             "component": "VCard", "props": {"variant": "outlined", "class": "h-100 rounded-lg"}, "content": [
                                 {"component": "VCardText", "content": [
                                     section_title("mdi-bell-outline", "下载与通知", "控制单次下载数量及成功通知"),
+                                    {"component": "VTextField", "props": {"model": "save_path", "label": "下载路径", "prepend-inner-icon": "mdi-folder-download-outline", "placeholder": "/downloadssd/local/", "hint": "必须位于 MoviePilot 已配置的下载目录内", "persistent-hint": True, "variant": "outlined", "density": "comfortable", "class": "mb-3"}},
+                                    {"component": "VSelect", "props": {"model": "downloader", "label": "下载器", "prepend-inner-icon": "mdi-download-network-outline", "items": [{"title": "跟随站点或系统默认", "value": ""}, {"title": "QB-NAS", "value": "QB-NAS"}, {"title": "TR-NAS", "value": "TR-NAS"}, {"title": "QB-OC芝加哥", "value": "QB-OC芝加哥"}], "item-title": "title", "item-value": "value", "hint": "留空时跟随天空站点设置或使用系统默认下载器", "persistent-hint": True, "variant": "outlined", "density": "comfortable", "class": "mb-3"}},
                                     {"component": "VTextField", "props": {"model": "limit", "label": "单次下载上限", "type": "number", "min": 0, "max": 50, "suffix": "个", "prepend-inner-icon": "mdi-download-multiple", "hint": "填 0 表示不限制", "persistent-hint": True, "variant": "outlined", "density": "comfortable", "class": "mb-3"}},
-                                    {"component": "VSwitch", "props": {"model": "notify", "label": "下载成功后发送通知", "color": "primary", "inset": True, "hint": "通过 MoviePilot 已启用的通知渠道发送", "persistent-hint": True}}
+                                    {"component": "VSwitch", "props": {"model": "notify", "label": "下载成功后发送通知", "color": "primary", "inset": True, "hint": "通过 MoviePilot 已启用的通知渠道发送", "persistent-hint": True}},
+                                    {"component": "VSwitch", "props": {"model": "check_library", "label": "下载前检查媒体库", "color": "primary", "inset": True, "hint": "媒体库已存在完整媒体时跳过下载，避免重复入库", "persistent-hint": True}}
                                 ]}
                             ]}]}
                     ]},
@@ -409,7 +441,7 @@ class HdskyMonitor(_PluginBase):
                     {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "density": "compact", "class": "mt-4", "text": "测试运行不会下载、不会发送通知，也不会写入历史记录。"}}
                 ]
             }]
-        }], {"enabled": False, "cron": "0 8,20 * * *", "days": 1, "max_pages": 5, "limit": 0, "notify": True}
+        }], {"enabled": False, "cron": "0 8,20 * * *", "days": 1, "max_pages": 5, "limit": 0, "notify": True, "save_path": "/downloadssd/local/", "downloader": "", "check_library": True}
 
     def stop_service(self) -> None:
         """停止插件服务"""

@@ -1,8 +1,15 @@
 """MoviePilot 下载任务提交。"""
 from .client import api_get, api_post
 
-def download_torrent_direct(enclosure, title, description="", site_name="天空", save_path="/downloadssd"):
-    """直接下载种子（构建完整的TorrentInfo对象）"""
+def download_torrent_direct(
+    enclosure,
+    title,
+    description="",
+    site_name="天空",
+    save_path="/downloadssd/local/",
+    downloader=None,
+):
+    """使用指定下载路径和下载器直接提交种子任务。"""
     # 获取站点信息
     sites = api_get("/api/v1/site/")
     site_info = None
@@ -30,6 +37,7 @@ def download_torrent_direct(enclosure, title, description="", site_name="天空"
     
     result = api_post("/api/v1/download/add", {
         "torrent_in": torrent_in,
-        "save_path": save_path
+        "downloader": downloader or site_info.get("downloader"),
+        "save_path": save_path or "/downloadssd/local/"
     })
     return result

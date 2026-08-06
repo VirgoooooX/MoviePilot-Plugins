@@ -157,6 +157,11 @@ def fetch_torrents_from_site(page=1):
         # 提取中文名（优先从描述中，兜底从标题解析）
         cn_match = re.search(r'(?:韩剧|国漫|美剧|日剧|英剧|国产剧|纪录片)[：:]\s*([^/|]+)', description)
         cn_name = cn_match.group(1).strip() if cn_match else None
+        # 天空部分描述不带类型前缀，例如“灿如繁星 / 狭路 全32集”。
+        if not cn_name:
+            plain_cn_match = re.match(r'^\s*([\u4e00-\u9fff][\u4e00-\u9fff·\s]{1,30})\s*(?:/|\||全\d+集|共\d+集)', description)
+            if plain_cn_match:
+                cn_name = plain_cn_match.group(1).strip()
         # 兜底：从种子标题提取中文名（格式如"中文名.English.Name.S01.2026.xxx"）
         if not cn_name:
             cn_title_match = re.search(r'^([\u4e00-\u9fff][\u4e00-\u9fff\w·\s]{1,20})[\.\s]', title)

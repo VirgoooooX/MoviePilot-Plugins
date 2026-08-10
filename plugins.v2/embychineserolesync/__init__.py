@@ -5,6 +5,7 @@ import json
 import queue
 import difflib
 import threading
+import unicodedata
 from dateutil.parser import isoparse
 from datetime import datetime, timedelta
 from typing import Any, List, Dict, Tuple, Optional
@@ -18,6 +19,7 @@ from app.core.config import settings
 from app.core.event import eventmanager, Event
 from app.plugins import _PluginBase
 from app.utils.string import StringUtils
+from app.utils.zhconv import convert as zhconv_convert
 from app.modules.douban import DoubanApi
 from app.modules.themoviedb import TmdbApi
 from app.schemas import WebhookEventInfo, ServiceInfo
@@ -29,15 +31,15 @@ class EmbyChineseRoleSync(_PluginBase):
     # 插件名称
     plugin_name = "Emby中文角色同步"
     # 插件描述
-    plugin_desc = "同步豆瓣中文演员与角色到电视剧/季/集，支持媒体库白名单过滤与手动精准同步。"
+    plugin_desc = "同步豆瓣中文演员与角色，支持剧集、媒体库筛选和手动同步。"
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "1.8.3"
+    plugin_version = "1.8.9"
     # 插件作者
     plugin_author = "xiaoQQya, Virgooooox"
     # 作者主页
-    author_url = "https://github.com/virgooooox"
+    author_url = "https://github.com/VirgoooooX"
     # 插件配置项ID前缀
     plugin_config_prefix = "embychineserolesync_"
     # 加载顺序
@@ -838,12 +840,18 @@ class EmbyChineseRoleSync(_PluginBase):
             if self._overwrite_episode_people or not current_people:
                 episode_info["People"] = [dict(person) for person in source_people]
             else:
-                by_name = {person.get("Name"): person for person in current_people}
+                by_identity = {
+                    self._person_relation_key(person): person
+                    for person in current_people
+                    if self._person_relation_key(person)
+                }
                 for person in source_people:
-                    target = by_name.get(person.get("Name"))
-                    if target and person.get("Role") and (self._overwrite_episode_people or not target.get("Role")):
+                    person_key = self._person_relation_key(person)
+                    target = by_identity.get(person_key)
+                    if target and person.get("Role") and not target.get("Role"):
+                        target["Name"] = person.get("Name") or target.get("Name")
                         target["Role"] = person.get("Role")
-                episode_info["People"] = list(by_name.values())
+                episode_info["People"] = list(by_identity.values())
             locked = episode_info.setdefault("LockedFields", [])
             if "Cast" not in locked:
                 locked.append("Cast")
@@ -935,7 +943,7 @@ class EmbyChineseRoleSync(_PluginBase):
             logger.info(f"<{media_name}> 季演职人员已存在，跳过更新演职人员")
             return season_info
 
-        tmdb_id = series_info.get("ProviderIds", {}).get("Tmdb")
+        tmdb_id = self._get_provider_id(series_info, "tmdb")
         season = season_info.get("IndexNumber")
         if not tmdb_id:
             logger.warning(f"<{media_name}> 媒体未获取到 TMDB ID，跳过更新演职人员")
@@ -982,7 +990,7 @@ class EmbyChineseRoleSync(_PluginBase):
                 logger.warning(f"<{media_name}> 季演职人员 {people_name} 信息刷新失败")
                 continue
 
-            people_tmdb_id = people_info.get("ProviderIds", {}).get("Tmdb")
+            people_tmdb_id = self._get_provider_id(people_info, "tmdb")
             people_overview = people_info.get("Overview")
             people_image = people_info.get("ImageTags", {}).get("Primary")
             if not people_overview or not people_image:
@@ -996,24 +1004,48 @@ class EmbyChineseRoleSync(_PluginBase):
 
         return updated_season_info
 
+    @staticmethod
+    def _person_relation_key(person: dict) -> Optional[Tuple[str, str]]:
+        """优先使用 Emby Person ID 构造关系键，仅在无 ID 时回退姓名与职务。"""
+        person_id = str(person.get("Id") or "").strip()
+        person_type = str(person.get("Type") or "").strip().lower()
+        if person_id:
+            return f"emby:{person_id}", person_type
+        name = str(person.get("Name") or "").strip().lower()
+        return (f"name:{name}", person_type) if name else None
+
     def _update_tv_credits(self, mediaserver: ServiceInfo, series_info: dict, season_info: dict):
-        """
-        更新系列演职人员
-        """
+        """按 Emby Person ID 将季度演职人员合并回电视剧总条目。"""
         item_id = series_info["Id"]
         series_name = series_info["Name"]
+        merged = {}
+        order = []
+        for people in series_info.get("People") or []:
+            key = self._person_relation_key(people)
+            if not key:
+                continue
+            if key not in merged:
+                merged[key] = dict(people)
+                order.append(key)
+            elif people.get("Role") and not merged[key].get("Role"):
+                merged[key]["Role"] = people.get("Role")
 
-        series_peoples = {people["Name"]: people for people in series_info.get("People") or []}
-        season_peoples = {people["Name"]: people for people in season_info.get("People") or []}
-        updated_series_peoples = []
-        for series_people in series_peoples.values():
-            series_people["Role"] = season_peoples.get(
-                series_people["Name"], {}).get("Role", series_people.get("Role"))
-            updated_series_peoples.append(series_people)
-        for season_people in season_peoples.values():
-            if season_people["Name"] not in series_peoples:
-                updated_series_peoples.append(season_people)
+        for season_people in season_info.get("People") or []:
+            key = self._person_relation_key(season_people)
+            if not key:
+                continue
+            current = merged.get(key)
+            if current is None:
+                merged[key] = dict(season_people)
+                order.append(key)
+                continue
+            current["Name"] = season_people.get("Name") or current.get("Name")
+            if season_people.get("Role") or not current.get("Role"):
+                current["Role"] = season_people.get("Role")
+            if current.get("Id") and current.get("PrimaryImageTag"):
+                current["PrimaryImageTag"] = current.get("PrimaryImageTag")
 
+        updated_series_peoples = [merged[key] for key in order]
         series_info["People"] = updated_series_peoples
         if "Cast" not in series_info.setdefault("LockedFields", []):
             series_info["LockedFields"].append("Cast")
@@ -1035,80 +1067,198 @@ class EmbyChineseRoleSync(_PluginBase):
             return True
         return False
 
+    @staticmethod
+    def _get_provider_id(item: Optional[dict], provider: str) -> Optional[str]:
+        """从 Emby 条目中读取不区分大小写的外部元数据 ID。"""
+        provider_ids = (item or {}).get("ProviderIds") or {}
+        provider_name = str(provider or "").lower()
+        for key, value in provider_ids.items():
+            if str(key).lower() == provider_name and value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _normalize_person_name(name: Any) -> str:
+        """规范化人物姓名，统一简繁体、大小写和空白后用于匹配。"""
+        text = unicodedata.normalize("NFKD", str(name or "").strip().lower())
+        text = "".join(ch for ch in text if not unicodedata.combining(ch))
+        text = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text)
+        if not text:
+            return ""
+        try:
+            return zhconv_convert(text, "zh-hans")
+        except Exception:
+            return text
+
+    @staticmethod
+    def _clean_role(role: Any) -> str:
+        """清理豆瓣角色前缀和通用职业描述。"""
+        role_text = str(role or "")
+        role_text = re.sub(r"饰\s+", "", role_text)
+        role_text = re.sub(r"饰演\s+", "", role_text)
+        role_text = re.sub(r"配\s+", "（配音）", role_text)
+        role_text = re.sub(r"配音\s+", "（配音）", role_text)
+        role_text = re.sub(r"演员", "", role_text)
+        role_text = re.sub(r"自己", "", role_text)
+        role_text = re.sub(r"\s*[（(]?\s*\bvoice\b\s*[）)]?\s*", "（配音）", role_text, flags=re.IGNORECASE)
+        role_text = re.sub(r"\s*[（(]?\s*\bdirector\b\s*[）)]?\s*", "（导演）", role_text, flags=re.IGNORECASE)
+        return role_text.strip()
+
+    def _build_douban_actor_index(self, douban_info: dict) -> Dict[str, List[dict]]:
+        """按豆瓣演员中英文名建立允许同名候选的索引。"""
+        actor_index: Dict[str, List[dict]] = {}
+        for actor in douban_info.get("actors", []) or []:
+            for name in (actor.get("name"), actor.get("latin_name")):
+                key = self._normalize_person_name(name)
+                if key:
+                    actor_index.setdefault(key, []).append(actor)
+        return actor_index
+
+    def _match_existing_person(
+        self,
+        mediaserver: ServiceInfo,
+        people: dict,
+        actor_index: Dict[str, List[dict]],
+    ) -> Tuple[Optional[dict], str, Optional[dict]]:
+        """仅为现有 Emby Person 匹配唯一豆瓣演员，不创建或搜索新人物。"""
+        person_info = self._get_item_info(mediaserver, people.get("Id")) if people.get("Id") else None
+        aliases: List[Tuple[str, str]] = [(people.get("Name"), "emby_relation_name")]
+        if person_info:
+            aliases.append((person_info.get("Name"), "emby_person_name"))
+        tmdb_id = self._get_provider_id(person_info, "tmdb")
+        if tmdb_id:
+            tmdb_info = self._tmdbapi.get_person_detail(tmdb_id) or {}
+            aliases.append((tmdb_info.get("name"), "tmdb_name"))
+            aliases.extend((name, "tmdb_alias") for name in (tmdb_info.get("also_known_as") or []))
+
+        matched: Dict[str, Tuple[dict, str]] = {}
+        for alias, evidence in aliases:
+            key = self._normalize_person_name(alias)
+            for actor in actor_index.get(key, []):
+                actor_id = str(actor.get("id") or id(actor))
+                matched.setdefault(actor_id, (actor, evidence))
+        if len(matched) != 1:
+            return None, "ambiguous" if matched else "unmatched", person_info
+        actor, evidence = next(iter(matched.values()))
+        return actor, evidence, person_info
+
+    def _build_chinese_role_plan(
+        self,
+        mediaserver: ServiceInfo,
+        peoples: List[dict],
+        douban_info: dict,
+        media_name: str,
+    ) -> dict:
+        """为现有 Emby 演员构建只读中文姓名与角色更新计划。"""
+        actor_index = self._build_douban_actor_index(douban_info)
+        actions = []
+        unmatched = []
+        ambiguous = []
+        for people in peoples:
+            actor, evidence, person_info = self._match_existing_person(mediaserver, people, actor_index)
+            if not actor:
+                target = ambiguous if evidence == "ambiguous" else unmatched
+                target.append({
+                    "emby_person_id": people.get("Id"),
+                    "name": people.get("Name"),
+                    "role": people.get("Role"),
+                })
+                continue
+            current_name = people.get("Name") or ""
+            current_role = people.get("Role") or ""
+            target_name = actor.get("name") or current_name
+            douban_role = actor.get("character") or ""
+            target_role = current_role if douban_role.strip() == "演员" else self._clean_role(douban_role)
+            actions.append({
+                "emby_person_id": people.get("Id"),
+                "tmdb_person_id": self._get_provider_id(person_info, "tmdb"),
+                "douban_person_id": actor.get("id"),
+                "current_name": current_name,
+                "target_name": target_name,
+                "current_role": current_role,
+                "target_role": target_role,
+                "evidence": evidence,
+                "name_changed": current_name != target_name,
+                "role_changed": current_role != target_role,
+            })
+
+        identities: Dict[str, List[dict]] = {}
+        for action in actions:
+            identity_keys = []
+            if action.get("tmdb_person_id"):
+                identity_keys.append(f"tmdb:{action.get('tmdb_person_id')}")
+            if action.get("douban_person_id"):
+                identity_keys.append(f"douban:{action.get('douban_person_id')}")
+            if not identity_keys:
+                identity_keys.append(f"emby:{action.get('emby_person_id')}")
+            for identity in identity_keys:
+                identities.setdefault(identity, []).append(action)
+        conflicts = []
+        for identity, items in identities.items():
+            person_ids = {str(item.get("emby_person_id")) for item in items if item.get("emby_person_id")}
+            if len(person_ids) > 1:
+                conflicts.append({"identity": identity, "items": items})
+
+        return {
+            "media": media_name,
+            "existing_people_count": len(peoples),
+            "douban_actor_count": len(douban_info.get("actors", []) or []),
+            "actions": actions,
+            "unmatched": unmatched,
+            "ambiguous": ambiguous,
+            "conflicts": conflicts,
+            "safe_to_apply": not conflicts and not ambiguous,
+        }
+
     def _update_chinese_role(self, mediaserver: ServiceInfo, media_type: MediaType, series_info: dict, season_info: Optional[dict]):
-        """
-        更新演职人员角色中文
-        """
+        """仅更新现有 Emby 演员的中文姓名与角色，并保留 Person ID。"""
         if media_type == MediaType.TV and season_info:
             peoples = season_info.get("People") or []
+            target_info = season_info
             media_name = f"{series_info.get('Name')}-{season_info.get('Name')}"
         else:
             peoples = series_info.get("People") or []
+            target_info = series_info
             media_name = series_info.get("Name")
 
         douban_info = self._get_douban_info(media_type, series_info, season_info)
         if not douban_info:
             logger.warning(f"<{media_name}> 获取豆瓣媒体信息失败，请检查配置")
             return None, None
-        douban_peoples = {}
-        for people in (douban_info.get("actors", [])):
-            douban_peoples[people["name"]] = people
-            if people.get("latin_name"):
-                douban_peoples[people["latin_name"]] = people
-        for people in peoples:
-            original_role = people.get("Role") or ""
-            if not StringUtils.is_chinese(people.get("Name")) or not StringUtils.is_chinese(people.get("Role")):
-                if people.get("Name") in douban_peoples:
-                    douban_person = douban_peoples[people["Name"]]
-                    douban_role = douban_person.get("character") or ""
-                    people["Name"] = douban_person["name"]
-                    if douban_role.strip() != "演员":
-                        people["Role"] = douban_role
-                    else:
-                        people["Role"] = original_role
-                else:
-                    people_info = self._get_item_info(mediaserver, people.get("Id"))
-                    if people_info and people_info.get("ProviderIds", {}).get("Tmdb"):
-                        people_tmdb_info = self._tmdbapi.get_person_detail(
-                            people_info.get("ProviderIds", {}).get("Tmdb"))
-                        also_known_as = people_tmdb_info.get("also_known_as", []) if people_tmdb_info else []
-                        for name in also_known_as:
-                            if name in douban_peoples:
-                                douban_person = douban_peoples[name]
-                                douban_role = douban_person.get("character") or ""
-                                people["Name"] = douban_person["name"]
-                                if douban_role.strip() != "演员":
-                                    people["Role"] = douban_role
-                                else:
-                                    people["Role"] = original_role
-                                break
-                    else:
-                        logger.warning(f"人员 <{people.get('Name')}> 未获取到 tmdbid，跳过更新演职人员角色中文")
-            role = people.get("Role", "")
-            role = re.sub(r"饰\s+", "", role)
-            role = re.sub(r"饰演\s+", "", role)
-            role = re.sub(r"配\s+", "（配音）", role)
-            role = re.sub(r"配音\s+", "（配音）", role)
-            role = re.sub(r"演员", "", role)
-            role = re.sub(r"自己", "", role)
-            role = re.sub(r"\s*[（(]?\s*\bvoice\b\s*[）)]?\s*", "（配音）", role, flags=re.IGNORECASE)
-            role = re.sub(r"\s*[（(]?\s*\bdirector\b\s*[）)]?\s*", "（导演）", role, flags=re.IGNORECASE)
-            people["Role"] = role
+        plan = self._build_chinese_role_plan(mediaserver, peoples, douban_info, media_name)
+        if not plan.get("safe_to_apply"):
+            logger.warning(f"<{media_name}> 人物身份匹配存在冲突，已停止写入：{plan}")
+            return None, None
 
-        if media_type == MediaType.TV and season_info:
-            if "Cast" not in season_info.setdefault("LockedFields", []):
-                season_info["LockedFields"].append("Cast")
-            updated = self._update_item_info(mediaserver, season_info["Id"], season_info)
-        else:
-            if "Cast" not in series_info.setdefault("LockedFields", []):
-                series_info["LockedFields"].append("Cast")
-            updated = self._update_item_info(mediaserver, series_info["Id"], series_info)
-        if updated:
-            logger.info(f"<{media_name}> 媒体演职人员角色中文更新成功")
-            return series_info, season_info
-        else:
+        actions = {str(item.get("emby_person_id")): item for item in plan.get("actions", [])}
+        for people in peoples:
+            action = actions.get(str(people.get("Id")))
+            if not action:
+                continue
+            person_id = people.get("Id")
+            if action.get("name_changed") and person_id:
+                person_info = self._get_item_info(mediaserver, person_id)
+                if not person_info:
+                    logger.warning(f"人员 <{people.get('Name')}> 无法读取 Person 实体，跳过姓名更新")
+                else:
+                    person_info["Name"] = action.get("target_name")
+                    locked = person_info.setdefault("LockedFields", [])
+                    if "Name" not in locked:
+                        locked.append("Name")
+                    if not self._update_item_info(mediaserver, person_id, person_info):
+                        logger.warning(f"人员 <{people.get('Name')}> Person 实体中文姓名更新失败")
+                        return None, None
+            # 关系始终保留原 Person ID，只更新显示名与角色。
+            people["Name"] = action.get("target_name") or people.get("Name")
+            people["Role"] = action.get("target_role")
+
+        if "Cast" not in target_info.setdefault("LockedFields", []):
+            target_info["LockedFields"].append("Cast")
+        if not self._update_item_info(mediaserver, target_info["Id"], target_info):
             logger.warning(f"<{media_name}> 媒体演职人员角色中文更新失败")
             return None, None
+        logger.info(f"<{media_name}> 现有演职人员中文姓名与角色更新成功")
+        return series_info, season_info
 
     def _get_douban_info(self, media_type: MediaType, series_info: dict, season_info: Optional[dict]):
         """
@@ -1503,8 +1653,8 @@ class EmbyChineseRoleSync(_PluginBase):
                 "component": "VImg",
                 "props": {
                     "src": poster,
-                    "height": "200",
-                    "cover": True,
+                    "aspect-ratio": 2 / 3,
+                    "contain": True,
                     "class": "rounded-t-lg bg-surface-variant"
                 }
             })
@@ -1513,7 +1663,7 @@ class EmbyChineseRoleSync(_PluginBase):
                 "component": "div",
                 "props": {
                     "class": "d-flex align-center justify-center rounded-t-lg bg-surface-variant",
-                    "style": "height:120px;"
+                    "style": "aspect-ratio:2/3;"
                 },
                 "content": [
                     {"component": "VIcon", "props": {"icon": "mdi-movie-open-outline", "size": "48", "color": "grey"}}
@@ -1553,7 +1703,7 @@ class EmbyChineseRoleSync(_PluginBase):
 
         return {
             "component": "VCol",
-            "props": {"cols": "12", "sm": "6", "md": "4", "lg": "3"},
+            "props": {"cols": "4", "sm": "4", "md": "2", "lg": "2"},
             "content": [
                 {
                     "component": "VCard",

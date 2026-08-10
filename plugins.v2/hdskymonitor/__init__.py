@@ -22,10 +22,12 @@ class HdskyMonitor(_PluginBase):
     plugin_name = "天空监控"
     plugin_desc = "定时监控天空站点新发布种子，自动下载并通知"
     plugin_icon = "signin.png"
-    plugin_version = "2.4.0"
+    plugin_version = "2.4.1"
     plugin_label = "站点订阅"
+    # 插件作者
     plugin_author = "Virgooooox"
-    author_url = "https://github.com/virgooooox"
+    # 作者主页
+    author_url = "https://github.com/VirgoooooX"
     plugin_config_prefix = "hdskymonitor_"
     plugin_order = 100
     auth_level = 1
@@ -325,12 +327,12 @@ class HdskyMonitor(_PluginBase):
         size_text = f"{size / 1073741824:.1f} GB" if size else "未知大小"
         return {
             "component": "VCol",
-            "props": {"cols": "6", "sm": "4", "md": "3", "lg": "2"},
+            "props": {"cols": "4", "sm": "4", "md": "2", "lg": "2"},
             "content": [{
                 "component": "VCard",
                 "props": {"variant": "flat", "class": "h-100 border rounded-lg overflow-hidden"},
                 "content": [
-                    {"component": "VImg", "props": {"src": item.get("poster") or "", "height": "225", "cover": True, "class": "bg-surface-variant"}},
+                    {"component": "VImg", "props": {"src": item.get("poster") or "", "aspect-ratio": 2 / 3, "contain": True, "class": "bg-surface-variant"}},
                     {"component": "VCardText", "props": {"class": "pa-3"}, "content": [
                         {"component": "div", "props": {"class": "text-body-2 font-weight-bold text-truncate mb-1", "title": name}, "text": name},
                         {"component": "div", "props": {"class": "d-flex align-center ga-1 mb-2 flex-wrap"}, "content": [

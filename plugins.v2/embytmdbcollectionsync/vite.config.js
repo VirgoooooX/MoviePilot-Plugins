@@ -21,5 +21,7 @@ export default defineConfig({
       format: 'esm',
     }),
   ],
-  build: { target: 'esnext', cssCodeSplit: true },
+  // Use the JavaScript-based Terser minifier so committed federation output is
+  // reproducible across Windows and Linux CI.
+  build: { target: 'esnext', cssCodeSplit: true, minify: 'terser' },
 })

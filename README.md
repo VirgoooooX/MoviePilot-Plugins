@@ -163,9 +163,10 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 - **按优先级选海报**：在元数据写入前拦截图片补全流程，根据自定义的来源与语言顺序筛选最佳主海报。
 - **中文地区标签兼容**：同时识别 TMDB 的复合地区标签与语言/地区分字段返回，支持 `zh-CN`、`zh-SG`、`zh-TW`、`zh-HK` 及旧版泛 `zh` 回退。
-- **可配置候选层与自由禁用**：支持在 Vuetify 配置界面中灵活调整候选层顺序或直接移除禁用特定候选层。
-- **背景图与 Logo 联动**：在选择主海报的同时，自动选择同次 TMDB 请求所得的背景图（backdrop）与标志图（logo）。
-- **线程池与选择缓存**：支持异步调用与单轮选择缓存机制，保证高并发入库时不阻塞识别且避免重复 API 请求。
+- **背景图与 Logo 多源联动**：不仅支持 TMDB 背景图与标志图，还可解析 Fanart 中的 Logo（`movielogo`/`tvlogo`）及背景图（`moviebackground`/`showbackground`）并按语言优先级选择。
+- **中文源语言智能回退**：对于中文源语言媒体，在配置缺省时自动插入 `tmdb_zh` 回退层，确保最佳中文画面匹配。
+- **线程池与选择缓存**：支持异步调用与单轮 LRU 缓存机制，保证高并发入库时不阻塞识别且避免重复 API 请求。
+- **运行日志与全链路诊断**：提供完善的同步/异步运行日志、跳过/未命中原因及详细候选匹配结果输出，方便追踪与定位问题。
 
 #### 配置说明
 
@@ -176,7 +177,7 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.2.0`
+`v1.3.0`
 
 ### Emby TMDB 合集整理（EmbyTmdbCollectionSync）
 

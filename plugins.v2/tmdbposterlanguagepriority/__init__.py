@@ -23,7 +23,7 @@ class TmdbPosterLanguagePriority(_PluginBase):
     plugin_name = "TMDB/Fanart 海报优先"
     plugin_desc = "按来源与语言优先级选择媒体海报。"
     plugin_icon = "fullscreenposterwall.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_label = "元数据,海报"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
@@ -206,11 +206,22 @@ class TmdbPosterLanguagePriority(_PluginBase):
     def obtain_images(self, mediainfo: MediaInfo) -> Optional[MediaInfo]:
         """在入库前选择主海报，并补齐同次请求可得的背景和标志图。"""
         if not self._enabled or not self._is_supported_media(mediainfo):
+            logger.info(
+                "图片优先插件跳过：enabled=%s, tmdb_id=%s, type=%s",
+                self._enabled,
+                getattr(mediainfo, "tmdb_id", None),
+                getattr(getattr(mediainfo, "type", None), "value", None),
+            )
             return None
 
+        logger.info("%s 图片优先插件开始选择（同步入口）", mediainfo.title_year)
         selected = self._select_images(mediainfo)
         if not selected.get("poster_url"):
-            logger.info("%s 未命中插件海报候选，交回 MoviePilot 原生图片链路", mediainfo.title_year)
+            logger.warning(
+                "%s 图片优先插件未选中海报，候选结果：%s",
+                mediainfo.title_year,
+                selected,
+            )
             return None
 
         mediainfo.poster_path = selected["poster_url"]
@@ -220,15 +231,20 @@ class TmdbPosterLanguagePriority(_PluginBase):
             mediainfo.logo_path = selected["logo_url"]
         setattr(mediainfo, "_poster_priority_selection", selected)
         logger.info(
-            "%s 入库前海报选择：%s（%s）",
+            "%s 图片优先插件选择结果：poster=%s [%s], logo=%s [%s], backdrop=%s [%s]",
             mediainfo.title_year,
-            selected.get("priority_label") or "未知层级",
-            selected.get("poster_language") or "未知语言",
+            selected.get("poster_url") or "无",
+            selected.get("priority_label") or "无",
+            selected.get("logo_url") or "无",
+            selected.get("logo_priority_label") or "无",
+            selected.get("backdrop_url") or "无",
+            selected.get("backdrop_priority_label") or "无",
         )
         return mediainfo
 
     async def async_obtain_images(self, mediainfo: MediaInfo) -> Optional[MediaInfo]:
         """在线程池中执行入库前图片选择，避免阻塞异步识别流程。"""
+        logger.info("%s 图片优先插件进入异步入口", getattr(mediainfo, "title_year", "未知媒体"))
         return await run_in_threadpool(self.obtain_images, mediainfo)
 
     def metadata_img(
@@ -303,6 +319,10 @@ class TmdbPosterLanguagePriority(_PluginBase):
     def _select_images(self, mediainfo: MediaInfo) -> Dict[str, Any]:
         """读取一次 TMDB 候选并按配置分别选择海报、Logo 和背景图。"""
         source_language = self._normalize_language(mediainfo.original_language)
+        priority = [item for item in self._priority if item not in {"tmdb_zh_tw", "tmdb_zh_hk"}]
+        if source_language in {"zh", "zh-cn", "zh-sg"} and "tmdb_zh" not in priority:
+            insert_at = priority.index("tmdb_original") if "tmdb_original" in priority else len(priority)
+            priority.insert(insert_at, "tmdb_zh")
         cache_key = (
             str(mediainfo.type.value),
             int(mediainfo.tmdb_id),
@@ -325,11 +345,11 @@ class TmdbPosterLanguagePriority(_PluginBase):
             "priority_key": None,
             "priority_label": None,
         }
-        if not self._priority:
+        if not priority:
             self._cache_selection(cache_key, empty)
             return empty
 
-        tmdb_images = self._get_tmdb_images(mediainfo, source_language)
+        tmdb_images = self._get_tmdb_images(mediainfo, source_language, priority)
         fanart_images: Optional[Dict[str, Any]] = None
 
         def get_fanart() -> Dict[str, Any]:
@@ -346,7 +366,7 @@ class TmdbPosterLanguagePriority(_PluginBase):
                 "logo": "logos",
                 "backdrop": "backdrops",
             }[kind]
-            for priority_key in self._priority:
+            for priority_key in priority:
                 if priority_key.startswith("tmdb_"):
                     candidate = self._pick_tmdb_priority(
                         tmdb_images.get(tmdb_key) or [],
@@ -409,14 +429,15 @@ class TmdbPosterLanguagePriority(_PluginBase):
                 del self._selection_cache[oldest_key]
 
     def _get_tmdb_images(
-        self, mediainfo: MediaInfo, source_language: str
+        self,
+        mediainfo: MediaInfo,
+        source_language: str,
+        priority: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """通过一次 TMDB images 请求获取所有启用语言层的候选。"""
         language_by_priority = {
             "tmdb_zh_cn": "zh-CN",
             "tmdb_zh_sg": "zh-SG",
-            "tmdb_zh_tw": "zh-TW",
-            "tmdb_zh_hk": "zh-HK",
             "tmdb_zh": "zh",
             "tmdb_original": source_language,
             "tmdb_en_us": "en-US",
@@ -424,7 +445,9 @@ class TmdbPosterLanguagePriority(_PluginBase):
             "tmdb_null": "null",
         }
         include_languages: List[str] = []
-        for priority_key in self._priority:
+        language_by_priority.pop("tmdb_zh_tw", None)
+        language_by_priority.pop("tmdb_zh_hk", None)
+        for priority_key in (priority or self._priority):
             language = language_by_priority.get(priority_key)
             if not language:
                 continue

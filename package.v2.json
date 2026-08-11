@@ -43,13 +43,13 @@
     "name": "TMDB/Fanart 海报优先",
     "description": "按来源与语言优先级选择媒体海报。",
     "labels": "元数据,海报",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "icon": "fullscreenposterwall.png",
     "author": "VirgoooooX",
     "level": 1,
     "system_version": ">=2.15.5",
     "history": {
-      "v1.2.0": "更新版本号至 1.2.0。",
+      "v1.3.0": "新增 Logo 与背景图联动选择、Fanart 多图类型提取、中文源智能回退及详细日志诊断。",
       "v1.1.0": "支持 TMDB 中文地区图片与旧泛语言标签兼容，补充繁简优先级、有界缓存和独立逻辑测试。",
       "v1.0.1": "精简插件简介并更新功能图标。",
       "v1.0.0": "首个正式版本：支持按 TMDB/Fanart 来源与语言优先级选择主海报。"

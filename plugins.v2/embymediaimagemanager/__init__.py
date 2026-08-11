@@ -28,7 +28,7 @@ class EmbyMediaImageManager(_PluginBase):
     plugin_name = "Emby媒体图片管理"
     plugin_desc = "Emby入库后实时刮削，并按目标媒体库周期审计简体中文图片。"
     plugin_icon = "image-search-outline"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     plugin_label = "媒体服务器,元数据"
@@ -58,6 +58,8 @@ class EmbyMediaImageManager(_PluginBase):
     _mediaservers: List[str] = []
     _realtime_libraries: List[str] = []
     _audit_libraries: List[str] = []
+    _emby_path_prefix = ""
+    _local_path_prefix = ""
 
     def init_plugin(self, config: Optional[dict] = None) -> None:
         """读取并规范化配置，同时清理上一轮延迟任务。"""
@@ -78,6 +80,8 @@ class EmbyMediaImageManager(_PluginBase):
         self._realtime_paths = str(config.get("realtime_paths") or "").strip()
         self._audit_paths = str(config.get("audit_paths") or "").strip()
         self._exclude_paths = str(config.get("exclude_paths") or "").strip()
+        self._emby_path_prefix = str(config.get("emby_path_prefix") or "").strip()
+        self._local_path_prefix = str(config.get("local_path_prefix") or "").strip()
         value = config.get("mediaservers") or []
         values = value if isinstance(value, list) else str(value).splitlines()
         self._mediaservers = list(
@@ -385,7 +389,8 @@ class EmbyMediaImageManager(_PluginBase):
                         library["server"], library["id"], stop_event
                     )
                 paths = list(dict.fromkeys(paths + recovered_paths))
-                for path in paths:
+                for raw_path in paths:
+                    path = self._map_emby_path(raw_path)
                     state = roots.setdefault(
                         self._state_key(Path(path)), {"path": path, "servers": set()}
                     )
@@ -553,6 +558,8 @@ class EmbyMediaImageManager(_PluginBase):
             "realtime_paths": "",
             "audit_paths": "",
             "exclude_paths": "",
+            "emby_path_prefix": "",
+            "local_path_prefix": "",
             "active_tab": "realtime",
         }
         realtime_content = [
@@ -780,7 +787,46 @@ class EmbyMediaImageManager(_PluginBase):
                                         ],
                                     },
                                 ],
-                            }
+                            },
+                            {
+                                "component": "VExpansionPanel",
+                                "content": [
+                                    {
+                                        "component": "VExpansionPanelTitle",
+                                        "text": "高级：Emby 路径映射",
+                                    },
+                                    {
+                                        "component": "VExpansionPanelText",
+                                        "content": [
+                                            {
+                                                "component": "VAlert",
+                                                "props": {
+                                                    "type": "info",
+                                                    "variant": "tonal",
+                                                    "density": "compact",
+                                                    "text": "只有 Emby 事件路径和 MoviePilot 实际挂载路径不一致时才填写。例如事件是 /media/media/...，而 MoviePilot 实际目录是 /media/...：Emby 前缀填 /media/media，MoviePilot 前缀填 /media。",
+                                                    "class": "mb-3",
+                                                },
+                                            },
+                                            {
+                                                "component": "VRow",
+                                                "content": [
+                                                    self._path_prefix_field(
+                                                        "emby_path_prefix",
+                                                        "Emby 路径前缀",
+                                                        "填写日志中收到的路径前缀，例如 /media/media。",
+                                                    ),
+                                                    self._path_prefix_field(
+                                                        "local_path_prefix",
+                                                        "MoviePilot 实际路径前缀",
+                                                        "填写 MoviePilot 容器/主机内真实存在的前缀，例如 /media。",
+                                                    ),
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
                         ],
                     },
                 ],
@@ -809,6 +855,27 @@ class EmbyMediaImageManager(_PluginBase):
                         "hint": hint,
                         "persistent-hint": True,
                         "no-data-text": "未读取到可用 Emby 媒体库，请先检查实例连接。",
+                    },
+                }
+            ],
+        }
+
+    @staticmethod
+    def _path_prefix_field(model: str, label: str, hint: str) -> dict:
+        """生成路径映射前缀输入列。"""
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "md": 6},
+            "content": [
+                {
+                    "component": "VTextField",
+                    "props": {
+                        "model": model,
+                        "label": label,
+                        "variant": "outlined",
+                        "clearable": True,
+                        "hint": hint,
+                        "persistent-hint": True,
                     },
                 }
             ],
@@ -1100,10 +1167,11 @@ class EmbyMediaImageManager(_PluginBase):
         if item_type not in {"Movie", "Episode", "Series"}:
             return
         raw_path = str(item.get("Path") or info.item_path or "").strip()
-        in_legacy_paths = self._path_allowed(raw_path, self._realtime_paths)
+        mapped_path = self._map_emby_path(raw_path)
+        in_legacy_paths = self._path_allowed(mapped_path, self._realtime_paths)
         if (
             not raw_path
-            or self._is_excluded(raw_path)
+            or self._is_excluded(mapped_path)
             or (
                 self._realtime_libraries
                 and not self._event_matches_selected_libraries(
@@ -1118,7 +1186,7 @@ class EmbyMediaImageManager(_PluginBase):
         if item_type in {"Episode", "Series"} and not self._tv_enabled:
             return
 
-        target_path = self._realtime_target(Path(raw_path), item_type)
+        target_path = self._realtime_target(Path(mapped_path), item_type)
         identity = str(
             item.get("SeriesId") or item.get("Id") or info.item_id or target_path
         )
@@ -1145,7 +1213,7 @@ class EmbyMediaImageManager(_PluginBase):
             self._timers[key] = timer
             timer.start()
         logger.info(
-            "Emby图片管理收到入库事件：%s，目标%s，延迟%s秒",
+            "Emby图片管理收到入库事件：%s，映射目标%s，延迟%s秒",
             raw_path,
             target_path,
             delay,
@@ -1399,6 +1467,32 @@ class EmbyMediaImageManager(_PluginBase):
             ):
                 return index
         return None
+
+    def _map_emby_path(self, path: str) -> str:
+        """将 Emby 事件路径映射为 MoviePilot 本地可访问路径。"""
+        source = self._normalize_path_prefix(self._emby_path_prefix)
+        target = self._normalize_path_prefix(self._local_path_prefix)
+        if not source or not target:
+            return str(path)
+        normalized = str(path).replace("\\", "/")
+        source_fold = source.casefold()
+        normalized_fold = normalized.casefold()
+        if normalized_fold == source_fold:
+            return target
+        prefix = f"{source}/"
+        if normalized_fold.startswith(prefix.casefold()):
+            return f"{target}/{normalized[len(prefix) :]}".replace("//", "/")
+        return str(path)
+
+    @staticmethod
+    def _normalize_path_prefix(value: Any) -> str:
+        """规范化路径映射前缀，保留根路径 `/`。"""
+        normalized = str(value or "").strip().replace("\\", "/")
+        if not normalized:
+            return ""
+        if normalized != "/":
+            normalized = normalized.rstrip("/")
+        return normalized
 
     def _path_allowed(self, path: str, configured: str) -> bool:
         """判断路径是否位于配置的目录范围内。"""

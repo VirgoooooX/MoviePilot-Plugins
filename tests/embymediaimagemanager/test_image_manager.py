@@ -342,6 +342,21 @@ def test_empty_library_path_uses_emby_items_for_audit_roots(monkeypatch):
     assert plugin._audit_roots() == [(Path("/media/movies/Foo"), ["LivingRoom"])]
 
 
+def test_emby_path_prefix_maps_to_moviepilot_mount():
+    plugin = _plugin(
+        {
+            "enabled": True,
+            "emby_path_prefix": "/media/media",
+            "local_path_prefix": "/media",
+        }
+    )
+    assert (
+        plugin._map_emby_path("/media/media/电影/Foo/Foo.strm")
+        == "/media/电影/Foo/Foo.strm"
+    )
+    assert plugin._map_emby_path("/media/metadata/Foo") == "/media/metadata/Foo"
+
+
 def test_form_exposes_library_selection_and_removes_webhook_source(monkeypatch):
     class Helper:
         def get_services(self, **_kwargs):
@@ -356,6 +371,8 @@ def test_form_exposes_library_selection_and_removes_webhook_source(monkeypatch):
     assert defaults["realtime_libraries"] == []
     assert defaults["audit_libraries"] == []
     assert defaults["active_tab"] == "realtime"
+    assert defaults["emby_path_prefix"] == ""
+    assert defaults["local_path_prefix"] == ""
 
     def walk(node):
         if isinstance(node, dict):

@@ -71,5 +71,18 @@
       "v1.0.1": "精简插件简介并更新功能图标。",
       "v1.0.0": "首个正式版本：支持 TMDB 合集预演、成员审核、合集校正、图片同步与中断恢复。"
     }
+  },
+  "EmbyMediaImageManager": {
+    "name": "Emby媒体图片管理",
+    "description": "Emby入库后实时刮削，并按目标媒体库周期审计简体中文图片。",
+    "labels": "媒体服务器,元数据",
+    "version": "1.0.0",
+    "icon": "image-search-outline",
+    "author": "VirgoooooX",
+    "level": 1,
+    "system_version": ">=2.15.5",
+    "history": {
+      "v1.0.0": "首个正式版本：支持 Emby 入库事件聚合刮削、多实例过滤、存量简体图片审计及运行状态展示。"
+    }
   }
 }

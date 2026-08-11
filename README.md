@@ -214,6 +214,29 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 `v1.3.0`
 
+### Emby媒体图片管理（EmbyMediaImageManager）
+
+实时刮削 Emby 新入库媒体，并按计划审计指定存量目录的简体中文图片。
+
+> 维护者：[VirgoooooX](https://github.com/VirgoooooX) · [源码仓库](https://github.com/VirgoooooX/MoviePilot-Plugins)
+
+#### 主要功能
+
+- **入库事件聚合**：接收 Emby `library.new` Webhook，电影按延迟处理，连续剧集事件按整部剧静默聚合，避免重复刮削。
+- **多实例与路径过滤**：可限制 Emby 实例、Webhook source、实时目录白名单及统一排除目录。
+- **简体图片审计**：按 Cron 计划扫描明确指定的目录，发现简体中文候选后覆盖刮削并刷新 Emby。
+- **安全运行状态**：审计任务互斥执行、分批保存进度；详情页展示待处理事件、已补齐媒体、等待候选和最近结果。
+
+#### 使用前提
+
+1. 在 Emby Webhook 插件中将地址指向 MoviePilot 的 `/api/v1/webhook/` 并携带 MoviePilot API Token。
+2. 启用“TMDB/Fanart 海报优先”插件后，周期审计才能判断候选图片是否属于简体中文层。
+3. MoviePilot 必须能够访问表单中填写的媒体目录路径。
+
+#### 当前版本
+
+`v1.0.0`
+
 ## 目录结构
 
 ```text
@@ -223,6 +246,8 @@ package.v2.json
 └── workflows/plugin-validation.yml
 plugins.v2/
 ├── embychineserolesync/
+│   └── __init__.py
+├── embymediaimagemanager/
 │   └── __init__.py
 ├── embytmdbcollectionsync/
 │   ├── __init__.py
@@ -246,6 +271,7 @@ plugins.v2/
     └── __init__.py
 tests/
 ├── embychineserolesync/
+├── embymediaimagemanager/
 ├── embytmdbcollectionsync/
 ├── hdskymonitor/
 └── tmdbposterlanguagepriority/
@@ -266,7 +292,7 @@ npm run build --prefix plugins.v2/embytmdbcollectionsync
 git diff --check
 ```
 
-三个插件的核心逻辑测试会安装最小宿主桩并在独立仓库环境实际执行；发布前仍应在 MoviePilot 宿主中做一次安装、页面加载与 API 冒烟验证。
+插件核心逻辑测试会安装最小宿主桩并在独立仓库环境实际执行；发布前仍应在 MoviePilot 宿主中做一次安装、页面加载与 API 冒烟验证。
 
 ## 免责声明
 

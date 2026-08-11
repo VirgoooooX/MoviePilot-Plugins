@@ -31,15 +31,16 @@ class EmbyChineseRoleSync(_PluginBase):
     # 插件名称
     plugin_name = "Emby中文角色同步"
     # 插件描述
-    plugin_desc = "同步豆瓣中文演员与角色，支持剧集、媒体库筛选和手动同步。"
+    plugin_desc = "将豆瓣中文演员姓名与角色信息同步到 Emby，支持媒体库范围、精准检索、批量同步、只读预演和冲突保护。"
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "1.8.9"
+    plugin_version = "1.0.0"
+    plugin_label = "媒体服务器,元数据"
     # 插件作者
-    plugin_author = "xiaoQQya, Virgooooox"
+    plugin_author = "xiaoQQya, VirgoooooX"
     # 作者主页
-    author_url = "https://github.com/VirgoooooX"
+    author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     # 插件配置项ID前缀
     plugin_config_prefix = "embychineserolesync_"
     # 加载顺序
@@ -71,7 +72,7 @@ class EmbyChineseRoleSync(_PluginBase):
       return;
     }
     model.search_feedback = '正在检索…';
-    const res = await window.MoviePilotAPI.get('plugin/EmbyChineseRoleSync/search_media', { params: { keyword: kw } });
+    const res = await window.MoviePilotAPI.get('plugin/__PLUGIN_ID__/search_media', { params: { keyword: kw } });
     const items = (res && Array.isArray(res.data)) ? res.data : [];
     const list = items.map(function (it) {
       return {
@@ -117,7 +118,7 @@ class EmbyChineseRoleSync(_PluginBase):
   });
   model.search_feedback = '正在同步 ' + items.length + ' 部作品，请稍候…';
   try {
-    const res = await window.MoviePilotAPI.post('plugin/EmbyChineseRoleSync/sync_media_batch', { items: items });
+    const res = await window.MoviePilotAPI.post('plugin/__PLUGIN_ID__/sync_media_batch', { items: items });
     model.search_feedback = (res && res.message) ? res.message : '同步完成';
   } catch (err) {
     model.search_feedback = '同步失败：' + ((err && err.message) ? err.message : String(err));
@@ -192,7 +193,7 @@ class EmbyChineseRoleSync(_PluginBase):
         """
         if self._enabled and self._cron:
             return [{
-                "id": "EmbyChineseRoleSync",
+                "id": self.__class__.__name__,
                 "name": self.plugin_name,
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.run,
@@ -1342,6 +1343,9 @@ class EmbyChineseRoleSync(_PluginBase):
                 ]}
             ]
         }
+        plugin_id = self.__class__.__name__
+        search_body_js = self._SEARCH_BODY_JS.replace("__PLUGIN_ID__", plugin_id)
+        sync_button_js = self._SYNC_BTN_JS.replace("__PLUGIN_ID__", plugin_id)
 
         return [
             {
@@ -1527,8 +1531,8 @@ class EmbyChineseRoleSync(_PluginBase):
                                                                     'variant': 'outlined',
                                                                     'density': 'comfortable',
                                                                     'hide-details': True,
-                                                                    'onUpdate:modelValue': self._SEARCH_AUTO_JS.replace("__SEARCH_BODY__", self._SEARCH_BODY_JS),
-                                                                    'onKeyup': self._SEARCH_ENTER_JS.replace("__SEARCH_BODY__", self._SEARCH_BODY_JS)
+                                                                    'onUpdate:modelValue': self._SEARCH_AUTO_JS.replace("__SEARCH_BODY__", search_body_js),
+                                                                    'onKeyup': self._SEARCH_ENTER_JS.replace("__SEARCH_BODY__", search_body_js)
                                                                 }
                                                             }
                                                         ]
@@ -1545,7 +1549,7 @@ class EmbyChineseRoleSync(_PluginBase):
                                                                     'block': True,
                                                                     'height': '44',
                                                                     'prepend-icon': 'mdi-magnify',
-                                                                    'onClick': self._SEARCH_BTN_JS.replace("__SEARCH_BODY__", self._SEARCH_BODY_JS)
+                                                                    'onClick': self._SEARCH_BTN_JS.replace("__SEARCH_BODY__", search_body_js)
                                                                 },
                                                                 'text': '搜索匹配'
                                                             }
@@ -1593,7 +1597,7 @@ class EmbyChineseRoleSync(_PluginBase):
                                                                     'block': True,
                                                                     'height': '44',
                                                                     'prepend-icon': 'mdi-sync',
-                                                                    'onClick': self._SYNC_BTN_JS
+                                                                    'onClick': sync_button_js
                                                                 },
                                                                 'text': '同步所选媒体'
                                                             }
@@ -1766,7 +1770,7 @@ class EmbyChineseRoleSync(_PluginBase):
             {
                 "component": "VBtn",
                 "props": {"color": color, "variant": "tonal", "prepend-icon": icon, "class": "flex-grow-1"},
-                "events": {"click": {"api": f"plugin/EmbyChineseRoleSync/{api_path}", "method": "POST"}},
+                "events": {"click": {"api": f"plugin/{self.__class__.__name__}/{api_path}", "method": "POST"}},
                 "text": label
             }
             for label, icon, color, api_path in actions

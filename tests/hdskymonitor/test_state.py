@@ -1,5 +1,12 @@
 """天空监控状态测试。"""
-from plugins.v2.hdskymonitor.state import MonitorState
+
+import sys
+from pathlib import Path
+
+PLUGIN_DIR = Path(__file__).resolve().parents[2] / "plugins.v2" / "hdskymonitor"
+sys.path.insert(0, str(PLUGIN_DIR))
+
+from state import MonitorState
 
 
 def test_atomic_state_roundtrip(tmp_path):

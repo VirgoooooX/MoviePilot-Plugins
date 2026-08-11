@@ -32,17 +32,18 @@ class MediaServerMsgLocal(_PluginBase):
     DEDUPE_EXPIRATION_TIME = 7200                  # 入库事件去重缓存过期时间（秒）
 
     # 插件基本信息
-    plugin_name = "媒体库服务器通知（本地修复版）"
+    plugin_name = "媒体库服务器通知增强版"
     # 插件描述
-    plugin_desc = "发送Emby/Jellyfin/Plex服务器的播放、入库等通知消息。"
+    plugin_desc = "聚合并发送 Emby/Jellyfin/Plex 播放与入库通知，优化剧集去重、延迟汇总和插件重载场景。"
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "1.8.2.5-local"
+    plugin_version = "1.0.0"
+    plugin_label = "媒体服务器,消息通知"
     # 插件作者
-    plugin_author = "jxxghp, local"
+    plugin_author = "jxxghp, VirgoooooX"
     # 作者主页
-    author_url = "https://github.com/jxxghp"
+    author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     # 插件配置项ID前缀
     plugin_config_prefix = "mediaservermsglocal_"
     # 加载顺序

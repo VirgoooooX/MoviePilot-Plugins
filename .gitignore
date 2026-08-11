@@ -8,9 +8,12 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+node_modules/
 build/
 develop-eggs/
 dist/
+!plugins.v2/embytmdbcollectionsync/dist/
+!plugins.v2/embytmdbcollectionsync/dist/**
 downloads/
 eggs/
 .eggs/
@@ -59,4 +62,3 @@ Thumbs.db
 .env
 .env.local
 plugins.v2/hdskymonitor/hdsky_monitor_state.json
-package.v2.json

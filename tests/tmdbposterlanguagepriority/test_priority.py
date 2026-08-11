@@ -1,6 +1,15 @@
 """TMDB/Fanart 海报优先插件的纯逻辑测试。"""
 
+import sys
 import threading
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("app", reason="需要 MoviePilot 宿主环境")
+
+PLUGIN_DIR = Path(__file__).resolve().parents[2] / "plugins.v2" / "tmdbposterlanguagepriority"
+sys.path.insert(0, str(PLUGIN_DIR))
 
 from app.core.context import MediaInfo
 from app.schemas.types import MediaType
@@ -58,12 +67,8 @@ def test_strict_tmdb_language_matching_excludes_traditional_and_short_zh():
         {"file_path": "/cn.jpg", "iso_639_1": "zh-CN", "vote_average": 1},
         {"file_path": "/sg.jpg", "iso_639_1": "zh-SG", "vote_average": 2},
     ]
-    cn = TmdbPosterLanguagePriority._pick_tmdb_priority(
-        images, "tmdb_zh_cn", "ja"
-    )
-    sg = TmdbPosterLanguagePriority._pick_tmdb_priority(
-        images, "tmdb_zh_sg", "ja"
-    )
+    cn = TmdbPosterLanguagePriority._pick_tmdb_priority(images, "tmdb_zh_cn", "ja")
+    sg = TmdbPosterLanguagePriority._pick_tmdb_priority(images, "tmdb_zh_sg", "ja")
     assert cn["url"].endswith("/cn.jpg")
     assert sg["url"].endswith("/sg.jpg")
 
@@ -112,10 +117,6 @@ def test_custom_order_is_applied():
 def test_no_candidate_returns_none_for_native_fallback():
     """全部候选缺失时应返回 None，让 MoviePilot 继续原生图片链路。"""
     plugin = _plugin(["tmdb_zh_cn"])
-    plugin._get_tmdb_images = lambda *_: {
-        "posters": [],
-        "backdrops": [],
-        "logos": [],
-    }
+    plugin._get_tmdb_images = lambda *_: {"posters": [], "backdrops": [], "logos": []}
     plugin._get_fanart_images = lambda *_: {"chinese": [], "english": []}
     assert plugin.obtain_images(_media()) is None

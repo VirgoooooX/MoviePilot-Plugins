@@ -2,11 +2,16 @@
 
 个人维护的 MoviePilot V2 插件仓库。
 
+- 维护者：[VirgoooooX](https://github.com/VirgoooooX)
+- 源码仓库：[VirgoooooX/MoviePilot-Plugins](https://github.com/VirgoooooX/MoviePilot-Plugins)
+
 ## 插件列表
 
 ### Emby中文角色同步（EmbyChineseRoleSync）
 
-增强版 Emby 元数据插件，用于自动同步豆瓣中文演员和角色信息到电视剧、季度及单集条目。支持媒体库白名单过滤、指定影视剧精准搜索与批量同步、身份冲突检测、只读预演、独立数据仪表盘及 2:3 竖版演职员海报墙。
+将豆瓣中文演员姓名与角色信息同步到 Emby，支持媒体库范围、精准检索、批量同步、只读预演和冲突保护。
+
+> 原作者：xiaoQQya · 维护者：[VirgoooooX](https://github.com/VirgoooooX) · [源码仓库](https://github.com/VirgoooooX/MoviePilot-Plugins)
 
 #### 主要功能
 
@@ -38,11 +43,13 @@
 
 #### 当前版本
 
-`v1.8.9`
+`v1.0.0`
 
 ### 天空监控（HdskyMonitor）
 
-定时监控天空站点中符合规则的资源，匹配全集后结合 TMDB 智能识别并自动提交到 MoviePilot 下载，同时通过 MoviePilot 统一通知渠道发送图文消息。
+监控天空站点新发布的剧集全集资源，结合 TMDB 识别、媒体库查重和下载器配置完成自动下载与通知。
+
+> 维护者：[VirgoooooX](https://github.com/VirgoooooX) · [源码仓库](https://github.com/VirgoooooX/MoviePilot-Plugins)
 
 #### 主要功能
 
@@ -115,11 +122,13 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v2.4.1`
+`v1.0.0`
 
-### 媒体库服务器通知（本地修复版）（MediaServerMsgLocal）
+### 媒体库服务器通知增强版（MediaServerMsgLocal）
 
-发送 Emby / Jellyfin / Plex 媒体服务器的播放、暂停、停止及入库 Webhook 通知；针对 TV 剧集入库事件提供时间窗口智能聚合与条目去重，避免消息轰炸。
+聚合并发送 Emby/Jellyfin/Plex 播放与入库通知，优化剧集去重、延迟汇总和插件重载场景。
+
+> 原作者：jxxghp · 维护者：[VirgoooooX](https://github.com/VirgoooooX) · [源码仓库](https://github.com/VirgoooooX/MoviePilot-Plugins)
 
 #### 主要功能
 
@@ -138,11 +147,13 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.8.2.5-local`
+`v1.0.0`
 
 ### TMDB/Fanart 海报优先（TmdbPosterLanguagePriority）
 
-在媒体入库前按可配置的来源与语言优先级自动选择主海报（例如 TMDB zh-CN → TMDB zh-SG → Fanart Chinese → TMDB 源语言 → TMDB en-US → Fanart English → TMDB null）。
+在媒体元数据写入前，按可配置的 TMDB/Fanart 来源与语言优先级选择主海报。
+
+> 维护者：[VirgoooooX](https://github.com/VirgoooooX) · [源码仓库](https://github.com/VirgoooooX/MoviePilot-Plugins)
 
 #### 主要功能
 
@@ -160,11 +171,13 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.1.0`
+`v1.0.0`
 
 ### Emby TMDB 合集整理（EmbyTmdbCollectionSync）
 
-按 TMDB 官方合集预演、审核并校正 Emby 电影合集，支持封面和徽标同步。
+基于 TMDB 官方合集预演并校正 Emby 电影合集，支持成员审核、封面徽标同步和中断恢复。
+
+> 维护者：[VirgoooooX](https://github.com/VirgoooooX) · [源码仓库](https://github.com/VirgoooooX/MoviePilot-Plugins)
 
 #### 主要功能
 
@@ -188,17 +201,21 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.0.4`
+`v1.0.0`
 
 ## 目录结构
 
 ```text
 package.v2.json
+.github/
+├── scripts/check_plugin_metadata.py
+└── workflows/plugin-validation.yml
 plugins.v2/
 ├── embychineserolesync/
 │   └── __init__.py
 ├── embytmdbcollectionsync/
 │   ├── __init__.py
+│   ├── dist/
 │   ├── index.html
 │   ├── package.json
 │   ├── src/
@@ -211,14 +228,30 @@ plugins.v2/
 │   ├── metadata.py
 │   ├── monitor.py
 │   ├── site.py
-│   ├── state.py
-│   └── tests/
+│   └── state.py
 ├── mediaservermsglocal/
 │   └── __init__.py
 └── tmdbposterlanguagepriority/
-    ├── __init__.py
-    └── tests/
+    └── __init__.py
+tests/
+├── hdskymonitor/
+└── tmdbposterlanguagepriority/
 ```
+
+## 开发校验
+
+本仓库按 MoviePilot V2 插件开发指南维护元数据、运行时属性和前端产物。提交前执行：
+
+```bash
+python .github/scripts/check_plugin_metadata.py package.v2.json
+python -m compileall -q plugins.v2
+python -m pytest -q
+npm ci --prefix plugins.v2/embytmdbcollectionsync
+npm run build --prefix plugins.v2/embytmdbcollectionsync
+git diff --check
+```
+
+`TmdbPosterLanguagePriority` 的完整测试依赖 MoviePilot 宿主；独立仓库环境会自动跳过该测试模块，宿主环境中应再运行一次真实加载验证。
 
 ## 免责声明
 

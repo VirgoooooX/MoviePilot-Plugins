@@ -1,0 +1,48 @@
+name: Plugin validation
+
+on:
+  push:
+    paths:
+      - "package.v2.json"
+      - "plugins.v2/**"
+      - ".github/scripts/check_plugin_metadata.py"
+      - ".github/workflows/plugin-validation.yml"
+  pull_request:
+    paths:
+      - "package.v2.json"
+      - "plugins.v2/**"
+      - ".github/scripts/check_plugin_metadata.py"
+      - ".github/workflows/plugin-validation.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test runner
+        run: python -m pip install pytest
+      - name: Validate plugin metadata
+        run: python .github/scripts/check_plugin_metadata.py package.v2.json
+      - name: Compile Python plugins
+        run: python -m compileall -q plugins.v2
+      - name: Run standalone tests
+        run: python -m pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: plugins.v2/embytmdbcollectionsync/package-lock.json
+      - name: Build Vue remote component
+        working-directory: plugins.v2/embytmdbcollectionsync
+        run: |
+          npm ci
+          npm run build
+      - name: Verify generated remote entry
+        run: test -f plugins.v2/embytmdbcollectionsync/dist/assets/remoteEntry.js
+      - name: Verify generated frontend is committed
+        run: git diff --exit-code -- plugins.v2/embytmdbcollectionsync/dist
+      - name: Check whitespace errors
+        run: git diff --check

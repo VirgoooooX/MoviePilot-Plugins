@@ -1,5 +1,12 @@
 """天空资源匹配规则测试。"""
-from plugins.v2.hdskymonitor.matcher import is_full_season, torrent_id_key
+
+import sys
+from pathlib import Path
+
+PLUGIN_DIR = Path(__file__).resolve().parents[2] / "plugins.v2" / "hdskymonitor"
+sys.path.insert(0, str(PLUGIN_DIR))
+
+from matcher import is_full_season, torrent_id_key
 
 
 def test_extract_torrent_id():

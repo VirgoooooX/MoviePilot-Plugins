@@ -20,14 +20,14 @@ class HdskyMonitor(_PluginBase):
     """天空种子监控插件 - 定时监控天空站点新发布种子，自动下载并通知"""
 
     plugin_name = "天空监控"
-    plugin_desc = "定时监控天空站点新发布种子，自动下载并通知"
+    plugin_desc = "监控天空站点新发布的剧集全集资源，结合 TMDB 识别、媒体库查重和下载器配置完成自动下载与通知。"
     plugin_icon = "signin.png"
-    plugin_version = "2.4.1"
-    plugin_label = "站点订阅"
+    plugin_version = "1.0.0"
+    plugin_label = "站点监控"
     # 插件作者
-    plugin_author = "Virgooooox"
+    plugin_author = "VirgoooooX"
     # 作者主页
-    author_url = "https://github.com/VirgoooooX"
+    author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     plugin_config_prefix = "hdskymonitor_"
     plugin_order = 100
     auth_level = 1
@@ -265,7 +265,7 @@ class HdskyMonitor(_PluginBase):
         if not self._enabled or not self._cron:
             return []
         return [{
-            "id": "HdskyMonitor",
+            "id": self.__class__.__name__,
             "name": "天空种子监控",
             "trigger": CronTrigger.from_crontab(self._cron),
             "func": self._run_scheduled,
@@ -362,7 +362,8 @@ class HdskyMonitor(_PluginBase):
             ("测试运行", "mdi-flask-outline", "warning", "hdsky_test"),
             ("清除去重", "mdi-delete-sweep-outline", "error", "hdsky_clear"),
         ]
-        action_buttons = [{"component": "VBtn", "props": {"color": color, "variant": "tonal", "prepend-icon": icon, "class": "flex-grow-1"}, "events": {"click": {"api": f"plugin/HdskyMonitor/{api}", "method": "POST"}}, "text": label} for label, icon, color, api in actions]
+        plugin_id = self.__class__.__name__
+        action_buttons = [{"component": "VBtn", "props": {"color": color, "variant": "tonal", "prepend-icon": icon, "class": "flex-grow-1"}, "events": {"click": {"api": f"plugin/{plugin_id}/{api}", "method": "POST"}}, "text": label} for label, icon, color, api in actions]
         history_cards = [self._build_history_card(item) for item in history[:24]]
         return [
             {"component": "div", "props": {"class": "pa-2 pa-sm-4"}, "content": [

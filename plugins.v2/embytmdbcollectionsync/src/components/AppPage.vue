@@ -66,6 +66,18 @@ async function restore(payload) {
   } catch (err) { error.value = err?.message || '恢复 TMDB 管理失败'; return false }
 }
 
+// 持久化忽略、手工锁定、删除并忽略等审核决定，再重新生成预演。
+async function collectionAction(payload) {
+  try {
+    unwrapResponse(await props.api.post(`${base.value}/collection-action`, payload))
+    if (payload.action !== 'restore_ignore' || config.value.server && (config.value.libraries || []).length) {
+      unwrapResponse(await props.api.post(`${base.value}/scan`, {}))
+    }
+    await loadStatus()
+    return true
+  } catch (err) { error.value = err?.message || '合集操作失败'; await loadStatus(); return false }
+}
+
 // 请求取消扫描或执行任务。
 async function cancel() {
   try { unwrapResponse(await props.api.post(`${base.value}/cancel`, {})); await loadStatus(); return true } catch (err) { error.value = err?.message || '取消任务失败'; return false }
@@ -78,5 +90,5 @@ onBeforeUnmount(() => timer && window.clearInterval(timer))
 
 <template>
   <VAlert v-if="error" type="error" variant="tonal" class="ma-4" :text="error" />
-  <CollectionManager :status="status" :config="config" :loading="loading" :saving="saving" :hide-title="hideTitle" @refresh="loadStatus" @save="saveConfig" @scan="scan" @apply="apply" @subscribe="subscribe" @restore="restore" @cancel="cancel" />
+  <CollectionManager :status="status" :config="config" :loading="loading" :saving="saving" :hide-title="hideTitle" @refresh="loadStatus" @save="saveConfig" @scan="scan" @apply="apply" @subscribe="subscribe" @restore="restore" @collection-action="collectionAction" @cancel="cancel" />
 </template>

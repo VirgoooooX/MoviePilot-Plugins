@@ -8,23 +8,33 @@ const props = defineProps({
   saving: Boolean,
   hideTitle: Boolean,
 })
-const emit = defineEmits(['refresh', 'save', 'scan', 'apply', 'subscribe', 'restore', 'cancel'])
+const emit = defineEmits(['refresh', 'save', 'scan', 'apply', 'subscribe', 'restore', 'collection-action', 'cancel'])
 
 const tab = ref('plan')
 const confirmDialog = ref(false)
 const detailsDialog = ref(false)
 const detailsRow = ref(null)
+const actionDialog = ref(false)
+const pendingAction = ref(null)
 const selected = ref([])
 const adopted = ref([])
 const plan = computed(() => props.status?.plan || {})
 const rows = computed(() => plan.value?.collections || [])
 const summary = computed(() => plan.value?.summary || {})
+const deferred = computed(() => plan.value?.deferred || [])
+const ignored = computed(() => props.status?.ignored || [])
 const job = computed(() => props.status?.job || {})
 const busy = computed(() => Boolean(job.value.running || job.value.busy))
 const planIdentity = computed(() => plan.value?.plan_id || plan.value?.created_at || '')
 const serverLibraries = computed(() => (props.status?.libraries || []).filter(item => !props.config.server || item.server === props.config.server))
 const libraryOptions = computed(() => serverLibraries.value.map(item => ({ title: `${item.name}（${item.count || 0}）`, value: item.id })))
 const serverOptions = computed(() => props.status?.servers || [])
+const stats = computed(() => [
+  ['电影', summary.value.movies || 0], ['合集', summary.value.collections || 0], ['新建', summary.value.create || 0],
+  ['待接管', summary.value.adopt || 0], ['加入', summary.value.add || 0], ['移除', summary.value.remove || 0],
+  ['缺片', summary.value.missing || 0], ['手工保护', summary.value.customized || 0],
+  ['暂缓', summary.value.deferred || 0], ['已忽略', summary.value.ignored || 0],
+])
 
 function resetSelection() {
   selected.value = []
@@ -32,6 +42,8 @@ function resetSelection() {
   confirmDialog.value = false
   detailsDialog.value = false
   detailsRow.value = null
+  actionDialog.value = false
+  pendingAction.value = null
 }
 
 // 新预演计划不能沿用旧计划的勾选和接管状态。
@@ -57,6 +69,33 @@ function subscribeMissing(row) {
 function restoreManagement(row) {
   if (busy.value || !row.customized) return
   emit('restore', { collection_id: String(row.key) })
+}
+
+const actionCopy = {
+  ignore: { title: '忽略这个 TMDB 合集', text: '以后扫描到它也不会再创建或提出接管。你可以在“已忽略”中恢复。', confirm: '确认忽略', color: 'warning' },
+  mark_custom: { title: '确认为手工合集', text: '插件会锁定当前 Emby 合集及其全部成员，后续不再移动、移除或重复分配这些电影。', confirm: '确认锁定', color: 'primary' },
+  delete_ignore: { title: '删除并忽略合集', text: '将删除这个插件管理的 Emby 合集，但不会删除其中的电影文件；同时永久忽略对应 TMDB 合集，避免以后重建。', confirm: '删除并忽略', color: 'error' },
+}
+
+function requestCollectionAction(row, action) {
+  pendingAction.value = { row, action }
+  actionDialog.value = true
+}
+
+function confirmCollectionAction() {
+  if (!pendingAction.value) return
+  const { row, action } = pendingAction.value
+  actionDialog.value = false
+  emit('collection-action', {
+    action,
+    collection_id: String(row.key),
+    plan_id: plan.value?.plan_id || '',
+  })
+  pendingAction.value = null
+}
+
+function restoreIgnored(item) {
+  emit('collection-action', { action: 'restore_ignore', collection_id: String(item.key) })
 }
 
 // 选择所有存在实际变更的合集。
@@ -144,20 +183,18 @@ function confirmApply() {
 
     <VTabs v-model="tab" class="mb-3">
       <VTab value="plan">变更计划</VTab>
+      <VTab value="deferred">暂缓 {{ deferred.length }}</VTab>
+      <VTab value="ignored">已忽略 {{ ignored.length }}</VTab>
       <VTab value="exceptions">异常项目 {{ plan.anomalies?.length || 0 }}</VTab>
     </VTabs>
 
     <VWindow v-model="tab">
       <VWindowItem value="plan">
-        <VRow class="mb-2">
-          <VCol v-for="item in [
-            ['电影', summary.movies || 0], ['合集', summary.collections || 0], ['新建', summary.create || 0],
-            ['待接管', summary.adopt || 0], ['加入', summary.add || 0], ['移除', summary.remove || 0],
-            ['缺片', summary.missing || 0], ['人工保护', summary.customized || 0]
-          ]" :key="item[0]" cols="6" sm="4" md="3" lg="1">
-            <VCard variant="tonal"><VCardText><div class="text-caption">{{ item[0] }}</div><div class="text-h5">{{ item[1] }}</div></VCardText></VCard>
-          </VCol>
-        </VRow>
+        <div class="stats-strip mb-5" aria-label="预演汇总">
+          <div v-for="item in stats" :key="item[0]" class="stat-cell">
+            <span class="stat-label">{{ item[0] }}</span><strong class="stat-value">{{ item[1] }}</strong>
+          </div>
+        </div>
 
         <VAlert v-if="!rows.length" type="info" variant="tonal" text="尚未生成预演计划。保存服务器和电影库后点击“生成预演”。" />
         <template v-else>
@@ -172,7 +209,7 @@ function confirmApply() {
           <div class="collection-grid" role="list" aria-label="TMDB 合集变更计划">
             <VCard v-for="row in rows" :key="row.key" class="collection-card" variant="outlined" role="listitem">
               <div class="collection-card__media">
-                <VImg v-if="row.poster" :src="row.poster" :alt="`${row.name} 海报`" cover height="248" />
+                <VImg v-if="row.poster" :src="row.poster" :alt="`${row.name} 海报`" cover aspect-ratio="0.667" />
                 <div v-else class="collection-card__placeholder" role="img" :aria-label="`${row.name} 无海报`"><VIcon icon="mdi-movie-filter-outline" size="48" /><span>暂无 TMDB 海报</span></div>
                 <div class="collection-card__overlay">
                   <VCheckboxBtn v-model="selected" :value="String(row.key)" color="primary" :disabled="row.customized" :aria-label="`选择 ${row.name}`" @click.stop />
@@ -183,36 +220,61 @@ function confirmApply() {
               </div>
               <VCardText class="collection-card__body">
                 <div class="collection-card__title" :title="row.name">{{ row.name }}</div>
-                <div class="text-caption text-medium-emphasis">TMDB {{ row.tmdb_id }} · 目标 {{ row.desired_movies?.length || 0 }} 部</div>
-                <div class="d-flex flex-wrap ga-1 mt-3" aria-label="变更数量">
+                <div class="collection-card__meta">TMDB {{ row.tmdb_id }} · {{ row.desired_movies?.length || 0 }} 部</div>
+                <div class="d-flex flex-wrap ga-1 mt-2" aria-label="变更数量">
                   <VChip v-if="row.add?.length" size="small" color="success" variant="tonal">加入 {{ row.add.length }}</VChip>
                   <VChip v-if="row.remove?.length" size="small" color="error" variant="tonal">移除 {{ row.remove.length }}</VChip>
                   <VChip v-if="row.poster || row.logo" size="small" color="info" variant="tonal">图片</VChip>
                   <VChip v-if="row.missing_movies?.length" size="small" color="warning" variant="tonal">缺片 {{ row.missing_movies.length }}</VChip>
                   <VChip v-if="!rowHasChanges(row)" size="small" variant="tonal">无成员变更</VChip>
                 </div>
-                <div v-if="row.add?.length || row.remove?.length" class="collection-card__preview text-caption mt-3">
-                  <div v-for="item in (row.add || []).slice(0, 2)" :key="`add-${item.id}`" class="text-success text-truncate">＋ {{ item.name }}</div>
-                  <div v-for="item in (row.remove || []).slice(0, 2)" :key="`remove-${item.Id || item.id}`" class="text-error text-truncate">－ {{ item.Name || item.name }}</div>
-                  <div v-if="(row.add?.length || 0) + (row.remove?.length || 0) > 4" class="text-medium-emphasis">还有更多成员，打开详情查看</div>
+                <div v-if="row.add?.length || row.remove?.length" class="collection-card__preview text-caption mt-2">
+                  <div v-for="item in (row.add || []).slice(0, 1)" :key="`add-${item.id}`" class="text-success text-truncate">＋ {{ item.name }}</div>
+                  <div v-for="item in (row.remove || []).slice(0, 1)" :key="`remove-${item.Id || item.id}`" class="text-error text-truncate">－ {{ item.Name || item.name }}</div>
                 </div>
-                <VAlert v-if="row.requires_adoption" class="mt-3" type="warning" variant="tonal" density="compact">
-                  同名合集“{{ row.candidate_name }}”
-                </VAlert>
-                <VAlert v-if="row.customized" class="mt-3" type="info" variant="tonal" density="compact">
-                  {{ row.customized_reason }}。当前成员优先，后续扫描不会移动或重复分配这些电影。
-                </VAlert>
+                <div v-if="row.requires_adoption" class="collection-card__notice mt-2 text-warning text-truncate">同名：{{ row.candidate_name }}</div>
+                <div v-if="row.customized" class="collection-card__notice mt-2 text-info text-truncate">已锁定：手工合集优先</div>
               </VCardText>
               <VCardActions class="pt-0">
-                <VBtn size="small" variant="text" prepend-icon="mdi-eye-outline" @click="openDetails(row)">查看详情</VBtn>
+                <VBtn size="small" variant="text" icon="mdi-eye-outline" aria-label="查看详情" @click="openDetails(row)" />
                 <VSpacer />
-                <VBtn v-if="row.missing_movies?.length" size="small" color="primary" variant="tonal" prepend-icon="mdi-bell-plus-outline" :disabled="busy" @click="subscribeMissing(row)">订阅缺片</VBtn>
-                <VBtn v-if="row.customized" size="small" color="warning" variant="text" :disabled="busy" @click="restoreManagement(row)">恢复 TMDB 管理</VBtn>
-                <VCheckbox v-if="row.requires_adoption" v-model="adopted" :value="String(row.key)" label="确认接管" color="warning" hide-details density="compact" @click.stop />
+                <VBtn v-if="row.missing_movies?.length" size="small" color="primary" variant="tonal" icon="mdi-bell-plus-outline" aria-label="订阅缺片" :disabled="busy" @click="subscribeMissing(row)" />
+                <VCheckboxBtn v-if="row.requires_adoption" v-model="adopted" :value="String(row.key)" color="warning" aria-label="确认接管" @click.stop />
+                <VMenu location="bottom end">
+                  <template #activator="{ props: menuProps }"><VBtn v-bind="menuProps" size="small" variant="text" icon="mdi-dots-vertical" aria-label="合集操作" /></template>
+                  <VList density="compact" min-width="220">
+                    <VListItem prepend-icon="mdi-eye-outline" title="查看详情" @click="openDetails(row)" />
+                    <VListItem v-if="row.missing_movies?.length" prepend-icon="mdi-bell-plus-outline" title="订阅全部缺片" @click="subscribeMissing(row)" />
+                    <VListItem v-if="!row.customized && (row.emby_id || row.candidate_emby_id)" prepend-icon="mdi-lock-check-outline" title="确认为手工合集" @click="requestCollectionAction(row, 'mark_custom')" />
+                    <VListItem v-if="row.customized" prepend-icon="mdi-lock-open-outline" title="恢复 TMDB 管理" @click="restoreManagement(row)" />
+                    <VDivider />
+                    <VListItem v-if="!row.managed" prepend-icon="mdi-eye-off-outline" title="忽略，不再生成" base-color="warning" @click="requestCollectionAction(row, 'ignore')" />
+                    <VListItem v-if="row.managed" prepend-icon="mdi-delete-forever-outline" title="删除并忽略" base-color="error" @click="requestCollectionAction(row, 'delete_ignore')" />
+                  </VList>
+                </VMenu>
               </VCardActions>
             </VCard>
           </div>
         </template>
+      </VWindowItem>
+      <VWindowItem value="deferred">
+        <VAlert class="mb-4" type="info" variant="tonal">这些合集现在不会创建。当 TMDB 至少已有两部常规电影上映，或第二部电影入库后，插件会自动重新评估。</VAlert>
+        <VList v-if="deferred.length" lines="three" class="rounded-lg" border>
+          <VListItem v-for="item in deferred" :key="item.key" :title="item.name" :subtitle="`${item.reason} · 已上映 ${item.released_count} · 未来或信息不完整 ${item.future_or_invalid_count}`">
+            <template #prepend><VAvatar color="surface-variant"><VIcon icon="mdi-timer-sand" /></VAvatar></template>
+          </VListItem>
+        </VList>
+        <VAlert v-else type="success" variant="tonal" text="没有因单片或未来影片而暂缓的合集。" />
+      </VWindowItem>
+      <VWindowItem value="ignored">
+        <VAlert class="mb-4" type="info" variant="tonal">忽略记录保存在插件数据库中，MoviePilot 重启后仍然有效。</VAlert>
+        <VList v-if="ignored.length" lines="two" class="rounded-lg" border>
+          <VListItem v-for="item in ignored" :key="item.key" :title="item.name" :subtitle="`${item.reason || '用户明确忽略'} · TMDB ${item.tmdb_id || item.key} · ${item.ignored_at || ''}`">
+            <template #prepend><VAvatar color="surface-variant"><VIcon icon="mdi-eye-off-outline" /></VAvatar></template>
+            <template #append><VBtn size="small" variant="tonal" :disabled="busy" @click="restoreIgnored(item)">恢复</VBtn></template>
+          </VListItem>
+        </VList>
+        <VAlert v-else type="info" variant="tonal" text="还没有永久忽略的 TMDB 合集。" />
       </VWindowItem>
       <VWindowItem value="exceptions">
         <VList v-if="plan.anomalies?.length" lines="two">
@@ -243,7 +305,21 @@ function confirmApply() {
             </VCol>
           </VRow>
         </VCardText>
-        <VCardActions><VSpacer /><VBtn @click="detailsDialog = false">关闭</VBtn></VCardActions>
+        <VCardActions>
+          <VBtn v-if="!detailsRow.customized && (detailsRow.emby_id || detailsRow.candidate_emby_id)" color="primary" variant="tonal" prepend-icon="mdi-lock-check-outline" @click="requestCollectionAction(detailsRow, 'mark_custom')">确认为手工合集</VBtn>
+          <VBtn v-if="detailsRow.customized" color="warning" variant="tonal" @click="restoreManagement(detailsRow)">恢复 TMDB 管理</VBtn>
+          <VBtn v-if="!detailsRow.managed" color="warning" variant="text" @click="requestCollectionAction(detailsRow, 'ignore')">忽略此合集</VBtn>
+          <VBtn v-if="detailsRow.managed" color="error" variant="text" @click="requestCollectionAction(detailsRow, 'delete_ignore')">删除并忽略</VBtn>
+          <VSpacer /><VBtn @click="detailsDialog = false">关闭</VBtn>
+        </VCardActions>
+      </VCard>
+    </VDialog>
+
+    <VDialog v-model="actionDialog" max-width="520">
+      <VCard v-if="pendingAction">
+        <VCardTitle>{{ actionCopy[pendingAction.action]?.title }}</VCardTitle>
+        <VCardText><strong>{{ pendingAction.row.name }}</strong><div class="mt-3 text-medium-emphasis">{{ actionCopy[pendingAction.action]?.text }}</div></VCardText>
+        <VCardActions><VSpacer /><VBtn @click="actionDialog = false">取消</VBtn><VBtn :color="actionCopy[pendingAction.action]?.color" variant="flat" @click="confirmCollectionAction">{{ actionCopy[pendingAction.action]?.confirm }}</VBtn></VCardActions>
       </VCard>
     </VDialog>
 
@@ -259,16 +335,26 @@ function confirmApply() {
 
 <style scoped>
 .collection-manager { max-width: 1500px; margin: 0 auto; }
-.collection-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
-.collection-card { min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+.stats-strip { display: grid; grid-template-columns: repeat(10, minmax(86px, 1fr)); overflow-x: auto; border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); border-radius: 14px; background: rgb(var(--v-theme-surface)); }
+.stat-cell { min-width: 86px; padding: 12px 14px; border-right: 1px solid rgba(var(--v-border-color), var(--v-border-opacity)); display: flex; flex-direction: column; gap: 3px; }
+.stat-cell:last-child { border-right: 0; }
+.stat-label { color: rgba(var(--v-theme-on-surface), .58); font-size: .75rem; line-height: 1; white-space: nowrap; }
+.stat-value { color: rgb(var(--v-theme-on-surface)); font-size: 1.45rem; line-height: 1.1; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.collection-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; }
+.collection-card { min-width: 0; display: flex; flex-direction: column; overflow: hidden; border-radius: 12px; }
 .collection-card__media { position: relative; background: rgb(var(--v-theme-surface-variant)); }
 .collection-card__overlay { position: absolute; inset: 0 0 auto 0; display: flex; align-items: center; justify-content: space-between; padding: 6px 8px; background: linear-gradient(180deg, rgba(0, 0, 0, .58), transparent); }
-.collection-card__placeholder { height: 248px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: rgba(var(--v-theme-on-surface), .58); }
-.collection-card__body { flex: 1; min-width: 0; }
-.collection-card__title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-.collection-card__preview { min-height: 42px; line-height: 1.45; }
+.collection-card__placeholder { aspect-ratio: 2 / 3; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: rgba(var(--v-theme-on-surface), .58); }
+.collection-card__body { flex: 1; min-width: 0; padding: 12px 12px 6px; }
+.collection-card__title { min-height: 2.55em; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; font-size: .9rem; line-height: 1.28; font-weight: 650; }
+.collection-card__meta { color: rgba(var(--v-theme-on-surface), .55); font-size: .7rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.collection-card__preview { min-height: 18px; line-height: 1.35; }
+.collection-card__notice { font-size: .7rem; }
+.collection-card :deep(.v-card-actions) { min-height: 42px; padding: 4px 6px 7px; }
 .details-placeholder { aspect-ratio: .667; display: grid; place-items: center; background: rgb(var(--v-theme-surface-variant)); color: rgba(var(--v-theme-on-surface), .58); border-radius: 8px; }
 .details-logo { background: rgb(var(--v-theme-surface-variant)); border-radius: 8px; }
-@media (max-width: 1100px) { .collection-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 620px) { .collection-grid { grid-template-columns: minmax(0, 1fr); } .collection-card__media :deep(.v-img) { height: 280px !important; } .collection-card__placeholder { height: 280px; } }
+@media (max-width: 1400px) { .collection-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+@media (max-width: 1120px) { .collection-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (max-width: 860px) { .collection-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 580px) { .collection-manager { padding-inline: 12px !important; } .collection-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } .collection-card__body { padding-inline: 9px; } }
 </style>

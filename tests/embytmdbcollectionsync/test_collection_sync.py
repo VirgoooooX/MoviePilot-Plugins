@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import types
+from datetime import date
 from enum import Enum
 from pathlib import Path
 
@@ -341,6 +342,69 @@ def test_collection_movies_are_compact_deduplicated_and_sorted():
     assert [item["tmdb_id"] for item in movies] == ["1", "2"]
     assert movies[1]["year"] == "2024"
     assert movies[1]["poster"].endswith("/two.jpg")
+
+
+def test_single_local_movie_is_deferred_until_two_regular_movies_are_released():
+    local = [{"id": "emby-1", "tmdb_id": "1"}]
+    one_released_one_future = [
+        {"tmdb_id": "1", "title": "已上映", "release_date": "2025-01-01"},
+        {"tmdb_id": "2", "title": "未来续集", "release_date": "2028-01-01"},
+    ]
+    assert EmbyTmdbCollectionSync._should_defer_single_movie_collection(
+        local, one_released_one_future, create=True, today=date(2026, 8, 11)
+    ) is True
+    two_released = one_released_one_future + [
+        {"tmdb_id": "3", "title": "另一部已上映", "release_date": "2024-01-01"}
+    ]
+    assert EmbyTmdbCollectionSync._should_defer_single_movie_collection(
+        local, two_released, create=True, today=date(2026, 8, 11)
+    ) is False
+    assert EmbyTmdbCollectionSync._should_defer_single_movie_collection(
+        local, one_released_one_future, create=False, today=date(2026, 8, 11)
+    ) is False
+    assert EmbyTmdbCollectionSync._regular_movie_release_date(
+        {"tmdb_id": "9", "title": "无日期占位", "release_date": ""}
+    ) is None
+    assert EmbyTmdbCollectionSync._regular_movie_release_date(
+        {"tmdb_id": "10", "title": "视频条目", "release_date": "2020-01-01", "video": True}
+    ) is None
+
+
+def test_ignore_collection_is_persisted_by_server_and_can_be_restored():
+    plugin = _plugin()
+    plugin._selected_service = lambda: ("emby", object())
+    plugin._store[plugin.DATA_PLAN] = {
+        "plan_id": "plan-ignore",
+        "collections": [{"key": "535313", "tmdb_id": 535313, "name": "哥斯拉（系列）", "create": True}],
+    }
+    ignored = plugin.api_collection_action({
+        "action": "ignore", "collection_id": "535313", "plan_id": "plan-ignore"
+    })
+    assert ignored.success is True
+    assert plugin._store[plugin.DATA_IGNORED]["emby:535313"]["name"] == "哥斯拉（系列）"
+    restored = plugin.api_collection_action({"action": "restore_ignore", "collection_id": "535313"})
+    assert restored.success is True
+    assert "emby:535313" not in plugin._store[plugin.DATA_IGNORED]
+
+
+def test_existing_emby_collection_can_be_explicitly_locked_as_custom():
+    plugin = _plugin()
+    plugin._selected_service = lambda: ("emby", object())
+    plugin._load_boxsets = lambda service: [{"Id": "godzilla-box", "Name": "我的哥斯拉全集"}]
+    plugin._load_boxset_members = lambda service, item_id: [{"Id": "g1"}, {"Id": "g2"}, {"Id": "g3"}]
+    plugin._store[plugin.DATA_PLAN] = {
+        "plan_id": "plan-custom",
+        "collections": [{
+            "key": "535313", "name": "哥斯拉（系列）", "candidate_emby_id": "godzilla-box"
+        }],
+    }
+    response = plugin.api_collection_action({
+        "action": "mark_custom", "collection_id": "535313", "plan_id": "plan-custom"
+    })
+    state = plugin._store[plugin.DATA_STATE]["emby:535313"]
+    assert response.success is True
+    assert state["customized"] is True
+    assert state["member_ids"] == ["g1", "g2", "g3"]
 
 
 def test_subscribe_endpoint_only_accepts_missing_movies_from_current_plan():

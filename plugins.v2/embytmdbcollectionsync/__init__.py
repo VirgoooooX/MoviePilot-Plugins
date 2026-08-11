@@ -4,7 +4,7 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Body
@@ -28,7 +28,7 @@ class EmbyTmdbCollectionSync(_PluginBase):
     plugin_name = "Emby TMDB 合集整理"
     plugin_desc = "按 TMDB 官方合集整理 Emby 电影。"
     plugin_icon = "TheMovieDb_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     plugin_label = "媒体服务器,元数据"
@@ -40,6 +40,7 @@ class EmbyTmdbCollectionSync(_PluginBase):
     DATA_PLAN = "latest_plan"
     DATA_CACHE = "tmdb_cache"
     DATA_JOB = "job_status"
+    DATA_IGNORED = "ignored_collections"
     CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
     CACHE_MAX_ENTRIES = 2000
     CACHE_FLUSH_INTERVAL = 100
@@ -107,6 +108,7 @@ class EmbyTmdbCollectionSync(_PluginBase):
             {"path": "/apply", "endpoint": self.api_start_apply, "methods": ["POST"], "auth": "bear", "summary": "执行计划"},
             {"path": "/subscribe", "endpoint": self.api_start_subscribe, "methods": ["POST"], "auth": "bear", "summary": "订阅合集缺片"},
             {"path": "/customization", "endpoint": self.api_restore_management, "methods": ["POST"], "auth": "bear", "summary": "恢复插件管理"},
+            {"path": "/collection-action", "endpoint": self.api_collection_action, "methods": ["POST"], "auth": "bear", "summary": "合集人工处置"},
             {"path": "/cancel", "endpoint": self.api_cancel, "methods": ["POST"], "auth": "bear", "summary": "取消任务"},
         ]
 
@@ -395,6 +397,15 @@ class EmbyTmdbCollectionSync(_PluginBase):
         services = self._services()
         plan = self.get_data(self.DATA_PLAN) or {}
         managed = self.get_data(self.DATA_STATE) or {}
+        ignored = self.get_data(self.DATA_IGNORED) or {}
+        if not isinstance(ignored, dict):
+            ignored = {}
+        ignored_server = self._server or str(plan.get("server") or "")
+        ignored_rows = [
+            {"key": key.split(":", 1)[1], **value}
+            for key, value in ignored.items()
+            if key.startswith(f"{ignored_server}:") and isinstance(value, dict)
+        ]
         return schemas.Response(success=True, data={
             "config": self._current_config(),
             "servers": [{"title": name, "value": name} for name in services],
@@ -402,6 +413,7 @@ class EmbyTmdbCollectionSync(_PluginBase):
             "plan": plan,
             "job": self._job(),
             "managed_count": len(managed) if isinstance(managed, dict) else 0,
+            "ignored": sorted(ignored_rows, key=lambda item: item.get("name") or ""),
         })
 
     def api_save_config(self, payload: dict = Body(...)) -> schemas.Response:
@@ -526,6 +538,103 @@ class EmbyTmdbCollectionSync(_PluginBase):
             self.save_data(self.DATA_STATE, managed)
         return schemas.Response(success=True, message="已解除保护，请重新生成预演后审核变更")
 
+    def api_collection_action(self, payload: Optional[dict] = Body(default=None)) -> schemas.Response:
+        """持久化忽略、确认手工合集、删除插件合集或恢复忽略状态。"""
+        payload = payload or {}
+        action = str(payload.get("action") or "")
+        collection_id = str(payload.get("collection_id") or "")
+        server_name, service = self._selected_service()
+        if not collection_id or not server_name:
+            return schemas.Response(success=False, message="缺少合集或 Emby 服务器")
+        if action not in {"ignore", "restore_ignore", "mark_custom", "delete_ignore"}:
+            return schemas.Response(success=False, message="不支持的合集操作")
+        with self._lock:
+            worker = getattr(self, "_worker", None)
+            if worker and worker.is_alive():
+                return schemas.Response(success=False, message="后台任务运行中，暂时不能修改合集状态")
+            state_key = f"{server_name}:{collection_id}"
+            ignored = self.get_data(self.DATA_IGNORED) or {}
+            managed = self.get_data(self.DATA_STATE) or {}
+            if not isinstance(ignored, dict):
+                ignored = {}
+            if not isinstance(managed, dict):
+                managed = {}
+
+            if action == "restore_ignore":
+                if state_key not in ignored:
+                    return schemas.Response(success=False, message="该合集不在忽略列表中")
+                ignored.pop(state_key, None)
+                self.save_data(self.DATA_IGNORED, ignored)
+                return schemas.Response(success=True, message="已恢复该 TMDB 合集，下次预演会重新评估")
+
+            plan = self.get_data(self.DATA_PLAN) or {}
+            if str(payload.get("plan_id") or "") != str(plan.get("plan_id") or ""):
+                return schemas.Response(success=False, message="预演计划已换代，请重新生成预演")
+            row = next(
+                (item for item in plan.get("collections") or [] if str(item.get("key")) == collection_id),
+                None,
+            )
+            if not row:
+                return schemas.Response(success=False, message="当前预演中不存在该合集")
+
+            delete_state = managed.get(state_key)
+            if action == "delete_ignore" and (
+                not isinstance(delete_state, dict)
+                or not row.get("emby_id")
+                or str(delete_state.get("emby_id") or "") != str(row.get("emby_id") or "")
+            ):
+                return schemas.Response(success=False, message="只能删除已由插件接管或创建的合集")
+
+            if action in {"ignore", "delete_ignore"}:
+                ignored[state_key] = {
+                    "tmdb_id": int(collection_id),
+                    "name": row.get("name") or collection_id,
+                    "reason": "用户明确忽略" if action == "ignore" else "用户删除并忽略",
+                    "ignored_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                # 先落盘忽略决定，即使 Emby 删除临时失败也不会在下次扫描重新创建。
+                self.save_data(self.DATA_IGNORED, ignored)
+                if action == "ignore":
+                    return schemas.Response(success=True, message="已永久忽略该 TMDB 合集，可在“已忽略”中恢复")
+
+            if not service:
+                return schemas.Response(success=False, message="当前 Emby 服务器不可用")
+            emby_id = str(row.get("emby_id") or row.get("candidate_emby_id") or "")
+            if action == "mark_custom":
+                if not emby_id:
+                    return schemas.Response(success=False, message="合集尚未存在于 Emby，不能确认为手工合集")
+                boxset = next((item for item in self._load_boxsets(service) if str(item.get("Id")) == emby_id), None)
+                if not boxset:
+                    return schemas.Response(success=False, message="Emby 合集已不存在，请重新预演")
+                members = self._load_boxset_members(service, emby_id)
+                member_ids, member_hash = self._member_snapshot(members)
+                managed[state_key] = {
+                    "tmdb_id": int(collection_id),
+                    "emby_id": emby_id,
+                    "name": row.get("name") or boxset.get("Name") or collection_id,
+                    "emby_name": boxset.get("Name"),
+                    "member_ids": member_ids,
+                    "member_hash": member_hash,
+                    "customized": True,
+                    "customized_at": datetime.now().isoformat(timespec="seconds"),
+                    "customized_reason": "用户手动确认为自定义合集",
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                managed_key_ids = {
+                    str(item.get("Id")) for item in members if isinstance(item, dict) and item.get("Id")
+                }
+                # 同一批成员可能仍挂在其它插件管理合集下；保留那些合集，但后续扫描会因成员保护而不再移动这些电影。
+                self.save_data(self.DATA_STATE, managed)
+                return schemas.Response(
+                    success=True,
+                    message=f"已锁定为手工合集并保护 {len(managed_key_ids)} 部电影",
+                )
+
+            self._delete_boxset(service, emby_id)
+            managed.pop(state_key, None)
+            self.save_data(self.DATA_STATE, managed)
+            return schemas.Response(success=True, message="已删除 Emby 合集并永久忽略对应 TMDB 合集")
+
     def api_cancel(self) -> schemas.Response:
         """请求取消当前扫描或执行任务。"""
         with self._lock:
@@ -563,6 +672,14 @@ class EmbyTmdbCollectionSync(_PluginBase):
             managed = self.get_data(self.DATA_STATE) or {}
             if not isinstance(managed, dict):
                 managed = {}
+            ignored = self.get_data(self.DATA_IGNORED) or {}
+            if not isinstance(ignored, dict):
+                ignored = {}
+            ignored_collection_ids = {
+                key.split(":", 1)[1]
+                for key in ignored
+                if key.startswith(f"{server_name}:")
+            }
             boxsets_by_id = {str(item.get("Id")): item for item in boxsets if item.get("Id")}
             member_cache: Dict[str, List[dict]] = {}
 
@@ -674,7 +791,12 @@ class EmbyTmdbCollectionSync(_PluginBase):
                     collection_id = str(collection.get("id") or "")
                     if collection_id:
                         official_collection_by_movie[str(movie.get("Id"))] = collection_id
-                    if collection_id and str(movie.get("Id")) not in protected_movie_ids and collection_id not in customized_states:
+                    if (
+                        collection_id
+                        and collection_id not in ignored_collection_ids
+                        and str(movie.get("Id")) not in protected_movie_ids
+                        and collection_id not in customized_states
+                    ):
                         group = groups.setdefault(collection_id, {"movies": [], "seed": collection})
                         group["movies"].append({"id": str(movie.get("Id")), "name": movie.get("Name"), "tmdb_id": tmdb_id})
                 if index == 1 or index == total or index % 5 == 0:
@@ -729,6 +851,7 @@ class EmbyTmdbCollectionSync(_PluginBase):
             self.save_data(self.DATA_CACHE, cache)
 
             rows = []
+            deferred: List[dict] = []
             boxsets_by_name = {str(item.get("Name") or "").casefold(): item for item in boxsets}
             all_library_tmdb_ids = {
                 str((movie.get("ProviderIds") or {}).get("Tmdb"))
@@ -758,7 +881,25 @@ class EmbyTmdbCollectionSync(_PluginBase):
                 desired_ids = {item["id"] for item in group["movies"]}
                 current_member_ids, current_member_hash = self._member_snapshot(current)
                 collection_movies = self._query_collection_movies(int(collection_id))
-                missing_movies = [item for item in collection_movies if str(item.get("tmdb_id")) not in all_library_tmdb_ids]
+                missing_movies = [
+                    item for item in collection_movies
+                    if self._regular_movie_release_date(item)
+                    and str(item.get("tmdb_id")) not in all_library_tmdb_ids
+                ]
+                create = not boxset and not candidate
+                if self._should_defer_single_movie_collection(group["movies"], collection_movies, create=create):
+                    released_count = sum(self._is_regular_released_movie(item) for item in collection_movies)
+                    deferred.append({
+                        "key": collection_id,
+                        "tmdb_id": int(collection_id),
+                        "name": metadata["name"],
+                        "local_movies": group["movies"],
+                        "collection_movies": collection_movies,
+                        "released_count": released_count,
+                        "future_or_invalid_count": max(len(collection_movies) - released_count, 0),
+                        "reason": "当前仅入库 1 部，且 TMDB 合集中不足 2 部常规电影已上映",
+                    })
+                    continue
                 rows.append({
                     "key": collection_id,
                     "tmdb_id": int(collection_id),
@@ -769,7 +910,7 @@ class EmbyTmdbCollectionSync(_PluginBase):
                     "current_emby_name": current_source.get("Name") if current_source else "",
                     "managed": bool(boxset and state),
                     "requires_adoption": bool(candidate and not state),
-                    "create": not boxset and not candidate,
+                    "create": create,
                     "desired_movies": group["movies"],
                     "add": [item for item in group["movies"] if item["id"] not in current_ids],
                     "remove": [
@@ -871,6 +1012,8 @@ class EmbyTmdbCollectionSync(_PluginBase):
                 "remove": sum(len(row.get("remove") or []) for row in rows),
                 "missing": sum(len(row.get("missing_movies") or []) for row in rows),
                 "customized": sum(1 for row in rows if row.get("customized")),
+                "deferred": len(deferred),
+                "ignored": len(ignored_collection_ids),
                 "anomalies": len(anomalies),
             }
             plan = {
@@ -881,6 +1024,7 @@ class EmbyTmdbCollectionSync(_PluginBase):
                 "config_fingerprint": self._config_fingerprint(),
                 "summary": summary,
                 "collections": sorted(rows, key=lambda row: row.get("name") or ""),
+                "deferred": sorted(deferred, key=lambda row: row.get("name") or ""),
                 "anomalies": anomalies,
             }
             self._check_stopped()
@@ -1069,8 +1213,45 @@ class EmbyTmdbCollectionSync(_PluginBase):
                 "year": release_date[:4] if len(release_date) >= 4 else "",
                 "release_date": release_date,
                 "poster": settings.TMDB_IMAGE_URL(poster_path) if poster_path else None,
+                "adult": bool(item.get("adult")),
+                "video": bool(item.get("video")),
             })
         return sorted(rows, key=lambda item: (item.get("release_date") or "9999", item.get("title") or ""))
+
+    @staticmethod
+    def _regular_movie_release_date(movie: dict) -> Optional[date]:
+        """返回常规 TMDB 电影的有效上映日期；占位、成人、视频或无日期条目返回空。"""
+        if not isinstance(movie, dict) or not movie.get("tmdb_id") or not movie.get("title"):
+            return None
+        if movie.get("adult") or movie.get("video"):
+            return None
+        release_date = str(movie.get("release_date") or "")
+        try:
+            return date.fromisoformat(release_date)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _is_regular_released_movie(cls, movie: dict, today: Optional[date] = None) -> bool:
+        """判断 TMDB 合集成员是否是已有明确上映日期且已经上映的常规电影。"""
+        released = cls._regular_movie_release_date(movie)
+        if not released:
+            return False
+        return released <= (today or date.today())
+
+    @classmethod
+    def _should_defer_single_movie_collection(
+        cls,
+        desired_movies: List[dict],
+        collection_movies: List[dict],
+        create: bool,
+        today: Optional[date] = None,
+    ) -> bool:
+        """新合集只有一部本地电影时，至少两部常规电影已上映才允许现在创建。"""
+        if not create or len(desired_movies or []) != 1 or not collection_movies:
+            return False
+        released_count = sum(cls._is_regular_released_movie(item, today=today) for item in collection_movies)
+        return released_count < 2
 
     @classmethod
     def _query_collection_movies(cls, collection_id: int) -> List[dict]:

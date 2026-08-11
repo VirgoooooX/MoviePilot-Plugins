@@ -351,8 +351,8 @@ def test_default_order_selects_fanart_chinese_before_source_language():
         "logos": [],
     }
     plugin._get_fanart_images = lambda *_: {
-        "chinese": [{"url": "https://fanart/zh.jpg", "lang": "zh", "likes": "1"}],
-        "english": [{"url": "https://fanart/en.jpg", "lang": "en", "likes": "9"}],
+        "chinese": {"poster": [{"url": "https://fanart/zh.jpg", "lang": "zh", "likes": "1"}]},
+        "english": {"poster": [{"url": "https://fanart/en.jpg", "lang": "en", "likes": "9"}]},
     }
     selected = plugin._select_images(_media("ja"))
     assert selected["priority_key"] == "fanart_chinese"
@@ -371,8 +371,8 @@ def test_custom_order_is_applied():
         "logos": [],
     }
     plugin._get_fanart_images = lambda *_: {
-        "chinese": [{"url": "https://fanart/zh.jpg", "lang": "zh", "likes": "99"}],
-        "english": [],
+        "chinese": {"poster": [{"url": "https://fanart/zh.jpg", "lang": "zh", "likes": "99"}]},
+        "english": {"poster": []},
     }
     selected = plugin._select_images(_media("ja"))
     assert selected["priority_key"] == "tmdb_original"

@@ -176,7 +176,7 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.1.0`
+`v1.2.0`
 
 ### Emby TMDB 合集整理（EmbyTmdbCollectionSync）
 

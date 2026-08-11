@@ -23,7 +23,7 @@ class TmdbPosterLanguagePriority(_PluginBase):
     plugin_name = "TMDB/Fanart 海报优先"
     plugin_desc = "按来源与语言优先级选择媒体海报。"
     plugin_icon = "fullscreenposterwall.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_label = "元数据,海报"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
@@ -192,6 +192,7 @@ class TmdbPosterLanguagePriority(_PluginBase):
         return {
             "obtain_images": self.obtain_images,
             "async_obtain_images": self.async_obtain_images,
+            "metadata_img": self.metadata_img,
         }
 
     def stop_service(self) -> None:
@@ -230,6 +231,47 @@ class TmdbPosterLanguagePriority(_PluginBase):
         """在线程池中执行入库前图片选择，避免阻塞异步识别流程。"""
         return await run_in_threadpool(self.obtain_images, mediainfo)
 
+    def metadata_img(
+        self,
+        mediainfo: MediaInfo,
+        season: Optional[int] = None,
+        episode: Optional[int] = None,
+    ) -> Optional[Dict[str, str]]:
+        """在最终刮削阶段返回插件选定的完整图片清单。"""
+        if (
+            not self._enabled
+            or season is not None
+            or episode is not None
+            or not self._is_supported_media(mediainfo)
+        ):
+            return None
+
+        selected = getattr(mediainfo, "_poster_priority_selection", None)
+        if not selected:
+            selected = self._select_images(mediainfo)
+
+        images: Dict[str, str] = {}
+        image_names = (
+            ("poster.jpg", "poster_url"),
+            ("logo.png", "logo_url"),
+            ("backdrop.jpg", "backdrop_url"),
+            ("fanart.jpg", "backdrop_url"),
+        )
+        for filename, key in image_names:
+            url = selected.get(key)
+            if url:
+                images[filename] = url
+
+        if images:
+            logger.info(
+                "%s 最终图片由插件接管：%s",
+                mediainfo.title_year,
+                ", ".join(f"{name}={url}" for name, url in images.items()),
+            )
+            return images
+        logger.info("%s 插件没有可用图片，交回 MoviePilot 原生图片链路", mediainfo.title_year)
+        return None
+
     @staticmethod
     def _is_supported_media(mediainfo: Optional[MediaInfo]) -> bool:
         """判断媒体是否具备 TMDB/Fanart 图片选择所需的类型和 ID。"""
@@ -259,7 +301,7 @@ class TmdbPosterLanguagePriority(_PluginBase):
         return normalized
 
     def _select_images(self, mediainfo: MediaInfo) -> Dict[str, Any]:
-        """读取一次 TMDB 候选并按配置按需读取 Fanart 后选择图片。"""
+        """读取一次 TMDB 候选并按配置分别选择海报、Logo 和背景图。"""
         source_language = self._normalize_language(mediainfo.original_language)
         cache_key = (
             str(mediainfo.type.value),
@@ -273,57 +315,77 @@ class TmdbPosterLanguagePriority(_PluginBase):
         if cached:
             return dict(cached)
 
+        empty = {
+            "poster_url": None,
+            "poster_language": None,
+            "logo_url": None,
+            "logo_language": None,
+            "backdrop_url": None,
+            "backdrop_language": None,
+            "priority_key": None,
+            "priority_label": None,
+        }
         if not self._priority:
-            selected = {
-                "poster_url": None,
-                "poster_language": None,
-                "priority_key": None,
-                "priority_label": None,
-                "backdrop_url": None,
-                "logo_url": None,
-            }
-            self._cache_selection(cache_key, selected)
-            return selected
+            self._cache_selection(cache_key, empty)
+            return empty
 
         tmdb_images = self._get_tmdb_images(mediainfo, source_language)
-        fanart_images: Optional[Dict[str, List[dict]]] = None
-        poster_url = None
-        poster_language = None
-        selected_priority = None
+        fanart_images: Optional[Dict[str, Any]] = None
 
-        for priority_key in self._priority:
-            if priority_key.startswith("tmdb_"):
-                candidate = self._pick_tmdb_priority(
-                    tmdb_images.get("posters") or [],
-                    priority_key,
-                    source_language,
-                )
-            else:
-                if fanart_images is None:
-                    fanart_images = self._get_fanart_images(mediainfo)
-                fanart_group = (
-                    fanart_images.get("chinese")
-                    if priority_key == "fanart_chinese"
-                    else fanart_images.get("english")
-                )
-                candidate = self._pick_fanart_image(fanart_group)
+        def get_fanart() -> Dict[str, Any]:
+            """按需读取 Fanart 图片候选。"""
+            nonlocal fanart_images
+            if fanart_images is None:
+                fanart_images = self._get_fanart_images(mediainfo)
+            return fanart_images
 
-            if candidate:
-                poster_url = candidate.get("url")
-                poster_language = candidate.get("language")
-                selected_priority = priority_key
-                break
+        def choose(kind: str) -> Optional[Dict[str, str]]:
+            """按统一优先级为指定图片类型选择一个候选。"""
+            tmdb_key = {
+                "poster": "posters",
+                "logo": "logos",
+                "backdrop": "backdrops",
+            }[kind]
+            for priority_key in self._priority:
+                if priority_key.startswith("tmdb_"):
+                    candidate = self._pick_tmdb_priority(
+                        tmdb_images.get(tmdb_key) or [],
+                        priority_key,
+                        source_language,
+                    )
+                else:
+                    group = (
+                        "chinese" if priority_key == "fanart_chinese" else "english"
+                    )
+                    candidate = self._pick_fanart_image(
+                        get_fanart().get(group, {}).get(kind) or []
+                    )
+                if candidate:
+                    candidate["priority_key"] = priority_key
+                    return candidate
+            return None
 
+        poster = choose("poster")
+        logo = choose("logo")
+        backdrop = choose("backdrop")
         selected = {
-            "poster_url": poster_url,
-            "poster_language": poster_language,
-            "priority_key": selected_priority,
-            "priority_label": self.PRIORITY_LABELS.get(selected_priority or ""),
-            "backdrop_url": self._pick_supporting_tmdb_image(
-                tmdb_images.get("backdrops") or [], source_language
+            "poster_url": poster.get("url") if poster else None,
+            "poster_language": poster.get("language") if poster else None,
+            "logo_url": logo.get("url") if logo else None,
+            "logo_language": logo.get("language") if logo else None,
+            "backdrop_url": backdrop.get("url") if backdrop else None,
+            "backdrop_language": backdrop.get("language") if backdrop else None,
+            "priority_key": poster.get("priority_key") if poster else None,
+            "priority_label": self.PRIORITY_LABELS.get(
+                poster.get("priority_key", "") if poster else ""
             ),
-            "logo_url": self._pick_supporting_tmdb_image(
-                tmdb_images.get("logos") or [], source_language
+            "logo_priority_key": logo.get("priority_key") if logo else None,
+            "logo_priority_label": self.PRIORITY_LABELS.get(
+                logo.get("priority_key", "") if logo else ""
+            ),
+            "backdrop_priority_key": backdrop.get("priority_key") if backdrop else None,
+            "backdrop_priority_label": self.PRIORITY_LABELS.get(
+                backdrop.get("priority_key", "") if backdrop else ""
             ),
         }
         self._cache_selection(cache_key, selected)
@@ -499,10 +561,14 @@ class TmdbPosterLanguagePriority(_PluginBase):
         file_path = ranked[0].get("file_path")
         return cls._tmdb_image_url(file_path) if file_path else None
 
-    def _get_fanart_images(self, mediainfo: MediaInfo) -> Dict[str, List[dict]]:
-        """获取 Fanart 原始主海报并拆分 Chinese 与 English 候选。"""
+    def _get_fanart_images(self, mediainfo: MediaInfo) -> Dict[str, Dict[str, List[dict]]]:
+        """获取 Fanart 海报、Logo 和背景并按语言分组。"""
+        empty = {
+            "chinese": {"poster": [], "logo": [], "backdrop": []},
+            "english": {"poster": [], "logo": [], "backdrop": []},
+        }
         if not settings.FANART_API_KEY:
-            return {"chinese": [], "english": []}
+            return empty
         if mediainfo.type == MediaType.MOVIE:
             query_type = "movies"
             query_id = mediainfo.tmdb_id
@@ -510,7 +576,7 @@ class TmdbPosterLanguagePriority(_PluginBase):
             query_type = "tv"
             query_id = mediainfo.tvdb_id
         if not query_id:
-            return {"chinese": [], "english": []}
+            return empty
 
         url = (
             f"https://webservice.fanart.tv/v3/{query_type}/{query_id}"
@@ -523,27 +589,34 @@ class TmdbPosterLanguagePriority(_PluginBase):
             payload = response.json() if response else {}
         except Exception as err:
             logger.warning("%s 获取 Fanart 图片候选失败：%s", mediainfo.title_year, err)
-            return {"chinese": [], "english": []}
+            return empty
 
-        poster_items: List[dict] = []
-        for key in ("movieposter", "tvposter"):
-            items = payload.get(key) or []
-            if isinstance(items, list):
-                poster_items.extend(items)
-        return {
-            "chinese": [
-                item
-                for item in poster_items
-                if self._normalize_fanart_language(item.get("lang")) == "zh"
-                and item.get("url")
-            ],
-            "english": [
-                item
-                for item in poster_items
-                if self._normalize_fanart_language(item.get("lang")) == "en"
-                and item.get("url")
-            ],
+        groups = {
+            "chinese": {"poster": [], "logo": [], "backdrop": []},
+            "english": {"poster": [], "logo": [], "backdrop": []},
         }
+        key_types = {
+            "movieposter": "poster",
+            "tvposter": "poster",
+            "movielogo": "logo",
+            "hdmovielogo": "logo",
+            "tvlogo": "logo",
+            "hdtvlogo": "logo",
+            "moviebackground": "backdrop",
+            "showbackground": "backdrop",
+        }
+        for key, image_type in key_types.items():
+            items = payload.get(key) or []
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not item.get("url"):
+                    continue
+                language = self._normalize_fanart_language(item.get("lang"))
+                group = "chinese" if language == "zh" else "english" if language == "en" else None
+                if group:
+                    groups[group][image_type].append(item)
+        return groups
 
     @classmethod
     def _pick_fanart_image(

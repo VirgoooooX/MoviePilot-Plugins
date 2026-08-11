@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,7 +28,7 @@ class EmbyMediaImageManager(_PluginBase):
     plugin_name = "Emby媒体图片管理"
     plugin_desc = "Emby入库后实时刮削，并按目标媒体库周期审计简体中文图片。"
     plugin_icon = "image-search-outline"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     plugin_label = "媒体服务器,元数据"
@@ -55,7 +56,6 @@ class EmbyMediaImageManager(_PluginBase):
     _audit_paths = ""
     _exclude_paths = ""
     _mediaservers: List[str] = []
-    _webhook_source = ""
 
     def init_plugin(self, config: Optional[dict] = None) -> None:
         """读取并规范化配置，同时清理上一轮延迟任务。"""
@@ -81,19 +81,169 @@ class EmbyMediaImageManager(_PluginBase):
         self._mediaservers = list(
             dict.fromkeys(str(item).strip() for item in values if str(item).strip())
         )
-        self._webhook_source = str(config.get("webhook_source") or "").strip()
-
+        libraries = config.get("media_libraries", config.get("libraries", [])) or []
+        library_values = (
+            libraries if isinstance(libraries, list) else str(libraries).splitlines()
+        )
+        self._media_libraries = list(
+            dict.fromkeys(
+                str(item).strip() for item in library_values if str(item).strip()
+            )
+        )
         self._lock = threading.RLock()
         # 保留同一把审计锁，避免插件热重载时新旧审计并行。
         self._audit_lock = getattr(self, "_audit_lock", threading.Lock())
         self._stop_event = threading.Event()
         self._pending: Dict[str, dict] = {}
         self._timers: Dict[str, threading.Timer] = {}
+        self._library_catalog: Dict[str, dict] = {}
+        self._library_catalog_at = 0.0
         self._last_realtime_at = ""
         self._last_realtime_result = "尚未处理入库事件"
         self._last_audit_at = ""
         self._last_audit_result = "尚未执行图片审计"
         self._audit_running = False
+
+    def _load_library_catalog(self, force: bool = False) -> Dict[str, dict]:
+        """读取 Emby 媒体库及其物理路径，短时缓存避免每个 Webhook 都请求服务。"""
+        now = time.monotonic()
+        if not force and now - getattr(self, "_library_catalog_at", 0.0) < 300:
+            return getattr(self, "_library_catalog", {})
+
+        catalog: Dict[str, dict] = {}
+        try:
+            services = (
+                MediaServerHelper().get_services(
+                    type_filter="emby", name_filters=self._mediaservers or None
+                )
+                or {}
+            )
+            for server_name, service in services.items():
+                instance = getattr(service, "instance", None)
+                if not instance or not hasattr(instance, "get_librarys"):
+                    continue
+                try:
+                    libraries = instance.get_librarys() or []
+                except Exception as err:
+                    logger.warning(
+                        "读取 Emby 实例 %s 的媒体库失败：%s", server_name, err
+                    )
+                    continue
+                for library in libraries:
+                    library_id = self._library_field(
+                        library, "id"
+                    ) or self._library_field(library, "item_id")
+                    name = str(self._library_field(library, "name") or "").strip()
+                    if not library_id or not name:
+                        continue
+                    key = self._library_key(server_name, library_id)
+                    catalog[key] = {
+                        "server": str(server_name),
+                        "id": str(library_id),
+                        "name": name,
+                        "type": str(self._library_field(library, "type") or "媒体库"),
+                        "item_count": self._library_field(library, "item_count"),
+                        "paths": self._normalize_library_paths(
+                            self._library_field(library, "path")
+                        ),
+                    }
+        except Exception as err:
+            logger.warning("读取 Emby 媒体库失败：%s", err, exc_info=True)
+        self._library_catalog = catalog
+        self._library_catalog_at = now
+        return catalog
+
+    def _library_options(self) -> List[dict]:
+        """生成配置页的媒体库选择项。"""
+        catalog = self._load_library_catalog(force=True)
+        options = []
+        for key, library in sorted(
+            catalog.items(),
+            key=lambda item: (item[1]["server"].casefold(), item[1]["name"].casefold()),
+        ):
+            if library["type"].casefold() not in {
+                "电影",
+                "电视剧",
+                "movie",
+                "series",
+                "tv",
+            }:
+                continue
+            count = self._library_field(library, "item_count")
+            suffix = f" · {count} 项" if count not in (None, "", 0) else ""
+            options.append(
+                {
+                    "title": f"{library['server']} / {library['name']}（{library['type']}）{suffix}",
+                    "value": key,
+                }
+            )
+        known = {item["value"] for item in options}
+        for key in self._media_libraries:
+            if key not in known:
+                options.append(
+                    {"title": f"已保存的媒体库（暂时无法读取）：{key}", "value": key}
+                )
+        return options
+
+    def _selected_library_paths(self, server_name: str) -> Tuple[bool, List[str]]:
+        """返回当前实例是否启用了媒体库筛选及其路径。"""
+        if not self._media_libraries:
+            return False, []
+        catalog = self._load_library_catalog()
+        paths: List[str] = []
+        for key in self._media_libraries:
+            library = catalog.get(key)
+            if library and library.get("server") == server_name:
+                paths.extend(library.get("paths") or [])
+        return True, self._split_paths("\n".join(paths))
+
+    def _audit_roots(self) -> List[Tuple[Path, List[str]]]:
+        """返回审计根目录及对应 Emby 实例，媒体库选择优先于旧路径配置。"""
+        roots: Dict[str, Dict[str, Any]] = {}
+        if self._media_libraries:
+            catalog = self._load_library_catalog()
+            for key in self._media_libraries:
+                library = catalog.get(key)
+                if not library:
+                    continue
+                for path in library.get("paths") or []:
+                    state = roots.setdefault(
+                        self._state_key(Path(path)), {"path": path, "servers": set()}
+                    )
+                    state["servers"].add(library["server"])
+        else:
+            for path in self._split_paths(self._audit_paths):
+                roots.setdefault(
+                    self._state_key(Path(path)), {"path": path, "servers": set()}
+                )
+        return [
+            (Path(state["path"]), sorted(state["servers"])) for state in roots.values()
+        ]
+
+    @staticmethod
+    def _library_field(value: Any, key: str, default: Any = None) -> Any:
+        """兼容 Pydantic 媒体库对象和旧版字典返回值。"""
+        if isinstance(value, dict):
+            return value.get(key, default)
+        return getattr(value, key, default)
+
+    @staticmethod
+    def _normalize_library_paths(value: Any) -> List[str]:
+        """把媒体库的单路径/多路径字段统一为多行路径。"""
+        if isinstance(value, str):
+            values = [value]
+        elif isinstance(value, (list, tuple, set)):
+            values = list(value)
+        else:
+            values = []
+        return list(
+            dict.fromkeys(str(item).strip() for item in values if str(item).strip())
+        )
+
+    @staticmethod
+    def _library_key(server_name: str, library_id: Any) -> str:
+        """生成跨媒体服务器不冲突的媒体库配置值。"""
+        return f"{str(server_name).strip()}::{str(library_id).strip()}"
 
     def get_state(self) -> bool:
         """返回插件启用状态。"""
@@ -130,7 +280,7 @@ class EmbyMediaImageManager(_PluginBase):
             "aggregate_seconds": 90,
             "audit_cron": self.DEFAULT_AUDIT_CRON,
             "mediaservers": [],
-            "webhook_source": "",
+            "media_libraries": [],
             "realtime_paths": "",
             "audit_paths": "",
             "exclude_paths": "",
@@ -196,7 +346,7 @@ class EmbyMediaImageManager(_PluginBase):
                     {
                         "component": "div",
                         "props": {"class": "text-body-2 text-medium-emphasis mb-3"},
-                        "text": "先限定事件来源，再设置等待窗口；剧集事件会聚合到整部剧目录。",
+                        "text": "先选择 Emby 实例和媒体库，再设置等待窗口；剧集事件会聚合到整部剧目录。",
                     },
                     {
                         "component": "VRow",
@@ -217,7 +367,7 @@ class EmbyMediaImageManager(_PluginBase):
                                             "chips": True,
                                             "closable-chips": True,
                                             "variant": "outlined",
-                                            "hint": "留空接收全部 Emby 实例；选择后同时限制 Webhook 与刷新目标。",
+                                            "hint": "留空接收全部 Emby 实例；选择后同时限制事件来源与刷新目标。",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -225,17 +375,23 @@ class EmbyMediaImageManager(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12},
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        "component": "VSelect",
                                         "props": {
-                                            "model": "webhook_source",
-                                            "label": "Webhook source（可选）",
+                                            "model": "media_libraries",
+                                            "label": "处理哪些媒体库",
+                                            "items": self._library_options(),
+                                            "item-title": "title",
+                                            "item-value": "value",
+                                            "multiple": True,
+                                            "chips": True,
+                                            "closable-chips": True,
                                             "variant": "outlined",
-                                            "hint": "仅接收这个 source；通常留空，交由 MoviePilot 匹配实例。",
+                                            "hint": "选择后自动使用 Emby 媒体库路径；留空表示处理所选 Emby 实例的全部媒体库。",
                                             "persistent-hint": True,
-                                            "clearable": True,
+                                            "no-data-text": "未读取到可用 Emby 媒体库，请先检查实例连接。",
                                         },
                                     }
                                 ],
@@ -253,24 +409,14 @@ class EmbyMediaImageManager(_PluginBase):
                         ],
                     },
                     {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "info",
-                            "variant": "outlined",
-                            "density": "compact",
-                            "text": "在 Emby Webhook 插件中将地址指向 MoviePilot 的 /api/v1/webhook/ 并携带 API Token；这里不填写完整 URL。",
-                            "class": "mb-4",
-                        },
-                    },
-                    {
                         "component": "VTextarea",
                         "props": {
                             "model": "realtime_paths",
-                            "label": "实时处理目录白名单",
+                            "label": "实时目录兜底（可选）",
                             "rows": 3,
                             "auto-grow": True,
                             "variant": "outlined",
-                            "hint": "每行一个宿主可访问路径；留空表示不限制。",
+                            "hint": "选择媒体库后可留空；仅在没有选择媒体库时作为路径白名单。",
                             "persistent-hint": True,
                         },
                     },
@@ -283,7 +429,7 @@ class EmbyMediaImageManager(_PluginBase):
                     {
                         "component": "div",
                         "props": {"class": "text-body-2 text-medium-emphasis mb-3"},
-                        "text": "只扫描明确列出的目录；已成功补齐简体图片的媒体会被记住并跳过。",
+                        "text": "优先扫描所选媒体库；没有选择媒体库时才使用下面的目录兜底。已成功补齐简体图片的媒体会被记住并跳过。",
                     },
                     {
                         "component": "VAlert",
@@ -321,11 +467,11 @@ class EmbyMediaImageManager(_PluginBase):
                                         "component": "VTextarea",
                                         "props": {
                                             "model": "audit_paths",
-                                            "label": "必须填写的审计目录",
+                                            "label": "审计目录兜底（可选）",
                                             "rows": 3,
                                             "auto-grow": True,
                                             "variant": "outlined",
-                                            "hint": "每行一个路径；留空时审计不会扫描任何目录。",
+                                            "hint": "选择媒体库后可留空；没有媒体库选择时，每行填写一个宿主可访问路径。",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -337,11 +483,11 @@ class EmbyMediaImageManager(_PluginBase):
                         "component": "VTextarea",
                         "props": {
                             "model": "exclude_paths",
-                            "label": "统一排除目录",
+                            "label": "排除目录（可选）",
                             "rows": 2,
                             "auto-grow": True,
                             "variant": "outlined",
-                            "hint": "每行一个路径，同时应用于实时刮削和周期审计。",
+                            "hint": "媒体库选择之外的高级排除项；每行一个路径，同时应用于实时刮削和周期审计。",
                             "persistent-hint": True,
                         },
                     },
@@ -406,6 +552,11 @@ class EmbyMediaImageManager(_PluginBase):
         pending_audit = sum(
             1 for item in states.values() if item.get("status") == "pending"
         )
+        scope_text = (
+            f"媒体库 {len(self._media_libraries)} 个"
+            if self._media_libraries
+            else "按所选实例全部媒体库"
+        )
         enabled_text = "运行中" if self._enabled else "已停用"
         status_color = "success" if self._enabled else "grey"
         return [
@@ -441,6 +592,11 @@ class EmbyMediaImageManager(_PluginBase):
                                         "component": "VChip",
                                         "props": {"variant": "tonal"},
                                         "text": f"审计 {'开启' if self._audit_enabled else '关闭'}",
+                                    },
+                                    {
+                                        "component": "VChip",
+                                        "props": {"variant": "tonal"},
+                                        "text": scope_text,
                                     },
                                     {"component": "VSpacer"},
                                     {
@@ -579,8 +735,6 @@ class EmbyMediaImageManager(_PluginBase):
         ):
             return
         server_name = str(info.server_name or "").strip()
-        if self._webhook_source and server_name != self._webhook_source:
-            return
         if self._mediaservers and server_name not in self._mediaservers:
             logger.debug(
                 "忽略未选 Emby 实例的入库事件：%s", server_name or "未识别实例"
@@ -592,10 +746,14 @@ class EmbyMediaImageManager(_PluginBase):
         if item_type not in {"Movie", "Episode", "Series"}:
             return
         raw_path = str(item.get("Path") or info.item_path or "").strip()
+        library_selected, library_paths = self._selected_library_paths(server_name)
+        in_library = any(self._is_under(raw_path, root) for root in library_paths)
+        in_legacy_paths = self._path_allowed(raw_path, self._realtime_paths)
         if (
             not raw_path
             or self._is_excluded(raw_path)
-            or not self._path_allowed(raw_path, self._realtime_paths)
+            or (library_selected and (not library_paths or not in_library))
+            or (not library_selected and not in_legacy_paths)
         ):
             return
         if item_type == "Movie" and not self._movie_enabled:
@@ -708,15 +866,14 @@ class EmbyMediaImageManager(_PluginBase):
             logger.warning("审计状态数据格式异常，已重建为空状态")
             states = {}
         try:
-            roots = self._split_paths(self._audit_paths)
+            roots = self._audit_roots()
             if not roots:
-                skip_reason = "未配置审计目录，未执行扫描"
-                logger.warning("未配置审计目录，跳过图片审计")
+                skip_reason = "未配置媒体库或审计目录，未执行扫描"
+                logger.warning("未配置媒体库或审计目录，跳过图片审计")
                 return
-            for root in roots:
+            for root_path, root_servers in roots:
                 if stop_event.is_set():
                     break
-                root_path = Path(root)
                 if not root_path.exists():
                     failed += 1
                     logger.warning("审计路径不存在：%s", root_path)
@@ -751,7 +908,8 @@ class EmbyMediaImageManager(_PluginBase):
                                     "priority": priority,
                                 }
                                 fixed += 1
-                                self._refresh_emby(None, None, media_path)
+                                for server_name in root_servers or [None]:
+                                    self._refresh_emby(server_name, None, media_path)
                             else:
                                 failed += 1
                         else:

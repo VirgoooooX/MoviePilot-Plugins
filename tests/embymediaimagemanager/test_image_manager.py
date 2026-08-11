@@ -228,6 +228,68 @@ def test_webhook_server_selection_is_an_actual_allowlist(monkeypatch):
     assert timers[0].cancelled is True
 
 
+def test_selected_media_library_controls_realtime_scope(monkeypatch):
+    class Library:
+        id = "movies"
+        name = "电影库"
+        type = "电影"
+        path = ["/media/movies"]
+        item_count = 12
+
+    class Instance:
+        def get_librarys(self):
+            return [Library()]
+
+    class Service:
+        instance = Instance()
+
+    class Helper:
+        def get_services(self, **_kwargs):
+            return {"LivingRoom": Service()}
+
+    monkeypatch.setattr(MODULE, "MediaServerHelper", Helper)
+    plugin = _plugin(
+        {
+            "enabled": True,
+            "mediaservers": ["LivingRoom"],
+            "media_libraries": ["LivingRoom::movies"],
+        }
+    )
+    assert plugin._selected_library_paths("LivingRoom") == (
+        True,
+        ["/media/movies"],
+    )
+    assert plugin._selected_library_paths("Other") == (True, [])
+    assert plugin._audit_roots() == [(Path("/media/movies"), ["LivingRoom"])]
+
+
+def test_form_exposes_library_selection_and_removes_webhook_source(monkeypatch):
+    class Helper:
+        def get_services(self, **_kwargs):
+            return {}
+
+        def get_configs(self):
+            return {}
+
+    monkeypatch.setattr(MODULE, "MediaServerHelper", Helper)
+    plugin = _plugin()
+    form, defaults = plugin.get_form()
+    assert defaults["media_libraries"] == []
+
+    def walk(node):
+        if isinstance(node, dict):
+            yield node
+            for child in node.get("content") or []:
+                yield from walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                yield from walk(child)
+
+    fields = [node.get("props", {}).get("model") for node in walk(form)]
+    assert "media_libraries" in fields
+    assert "webhook_source" not in fields
+
+
 def test_scrape_failure_does_not_refresh_emby(tmp_path):
     plugin = _plugin()
     plugin._pending["job"] = {"path": str(tmp_path), "server": "Emby", "item_id": "1"}

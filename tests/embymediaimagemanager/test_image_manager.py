@@ -272,6 +272,76 @@ def test_legacy_library_config_is_kept_as_audit_scope_only():
     assert plugin._audit_libraries == ["LivingRoom::foreign"]
 
 
+def test_empty_library_path_uses_item_ancestors_for_realtime_scope(monkeypatch):
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return [{"Id": "movies", "Name": "外语电影"}]
+
+    class Library:
+        id = "movies"
+        name = "外语电影"
+        type = "电影"
+        path = []
+
+    class Instance:
+        def get_librarys(self):
+            return [Library()]
+
+        def get_data(self, **_kwargs):
+            return Response()
+
+    class Service:
+        instance = Instance()
+
+    class Helper:
+        def get_services(self, **_kwargs):
+            return {"LivingRoom": Service()}
+
+    monkeypatch.setattr(MODULE, "MediaServerHelper", Helper)
+    plugin = _plugin({"enabled": True, "realtime_libraries": ["LivingRoom::movies"]})
+    item = {"Id": "movie-1", "Type": "Movie", "Path": "/mapped/movie.mkv"}
+    info = types.SimpleNamespace(item_id="movie-1")
+    assert plugin._event_matches_selected_libraries(
+        "LivingRoom", "/mapped/movie.mkv", item, info
+    )
+
+
+def test_empty_library_path_uses_emby_items_for_audit_roots(monkeypatch):
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"Items": [{"Type": "Movie", "Path": "/media/movies/Foo/Foo.mkv"}]}
+
+    class Library:
+        id = "movies"
+        name = "外语电影"
+        type = "电影"
+        path = []
+
+    class Instance:
+        def get_librarys(self):
+            return [Library()]
+
+        def get_data(self, **_kwargs):
+            return Response()
+
+    class Service:
+        instance = Instance()
+
+    class Helper:
+        def get_services(self, **_kwargs):
+            return {"LivingRoom": Service()}
+
+    monkeypatch.setattr(MODULE, "MediaServerHelper", Helper)
+    plugin = _plugin({"enabled": True, "audit_libraries": ["LivingRoom::movies"]})
+    assert plugin._audit_roots() == [(Path("/media/movies/Foo"), ["LivingRoom"])]
+
+
 def test_form_exposes_library_selection_and_removes_webhook_source(monkeypatch):
     class Helper:
         def get_services(self, **_kwargs):

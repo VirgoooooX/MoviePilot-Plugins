@@ -28,7 +28,7 @@ class EmbyMediaImageManager(_PluginBase):
     plugin_name = "Emby媒体图片管理"
     plugin_desc = "Emby入库后实时刮削，并按目标媒体库周期审计简体中文图片。"
     plugin_icon = "image-search-outline"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     plugin_label = "媒体服务器,元数据"
@@ -224,16 +224,168 @@ class EmbyMediaImageManager(_PluginBase):
                 paths.extend(library.get("paths") or [])
         return True, self._split_paths("\n".join(paths))
 
-    def _audit_roots(self) -> List[Tuple[Path, List[str]]]:
-        """返回审计根目录及对应 Emby 实例，媒体库选择优先于旧路径配置。"""
+    def _event_matches_selected_libraries(
+        self,
+        server_name: str,
+        raw_path: str,
+        item: dict,
+        info: WebhookEventInfo,
+    ) -> bool:
+        """按路径优先、库 ID/祖先关系兜底判断实时事件所属媒体库。"""
+        selected = self._realtime_libraries
+        if not selected:
+            return True
+
+        catalog = self._load_library_catalog()
+        records = [
+            catalog[key]
+            for key in selected
+            if key in catalog and catalog[key].get("server") == server_name
+        ]
+        selected_ids = {
+            self._library_id_from_key(key)
+            for key in selected
+            if self._library_server_from_key(key) == server_name
+        }
+        selected_ids.discard("")
+        selected_names = {
+            str(record.get("name") or "").casefold()
+            for record in records
+            if record.get("name")
+        }
+        roots = [path for record in records for path in record.get("paths") or []]
+        if roots and any(self._is_under(raw_path, root) for root in roots):
+            return True
+
+        event_ids = {
+            str(item.get(field) or "").strip()
+            for field in ("LibraryId", "TopParentId", "ParentId", "ParentItemId")
+        }
+        event_ids.update(
+            str(getattr(info, field, "") or "").strip()
+            for field in ("library_id", "top_parent_id", "parent_id")
+            if hasattr(info, field)
+        )
+        if selected_ids.intersection(event_ids):
+            logger.debug(
+                "实时事件通过 Emby 媒体库 ID 匹配：server=%s, item=%s",
+                server_name,
+                item.get("Id") or info.item_id,
+            )
+            return True
+
+        event_library_names = {
+            str(item.get(field) or "").strip().casefold()
+            for field in ("LibraryName", "TopParentName", "ParentName")
+        }
+        if selected_names.intersection(event_library_names):
+            return True
+
+        item_id = str(item.get("Id") or info.item_id or "").strip()
+        if not item_id or not selected_ids:
+            logger.warning(
+                "实时事件无法确认媒体库，已跳过：server=%s, path=%s, selected=%s",
+                server_name,
+                raw_path,
+                selected,
+            )
+            return False
+        if self._emby_item_in_selected_libraries(
+            server_name, item_id, selected_ids, selected_names
+        ):
+            logger.debug(
+                "实时事件通过 Emby Ancestors 兜底匹配：server=%s, item=%s",
+                server_name,
+                item_id,
+            )
+            return True
+        logger.warning(
+            "实时事件不属于已选媒体库，已跳过：server=%s, item=%s, path=%s",
+            server_name,
+            item_id,
+            raw_path,
+        )
+        return False
+
+    def _emby_item_in_selected_libraries(
+        self,
+        server_name: str,
+        item_id: str,
+        selected_ids: set[str],
+        selected_names: set[str],
+    ) -> bool:
+        """通过 Emby Ancestors API 确认条目顶级媒体库。"""
+        try:
+            services = (
+                MediaServerHelper().get_services(
+                    type_filter="emby", name_filters=[server_name]
+                )
+                or {}
+            )
+            service = services.get(server_name)
+            instance = getattr(service, "instance", None) if service else None
+            if not instance or not hasattr(instance, "get_data"):
+                return False
+            response = instance.get_data(
+                url=f"[HOST]emby/Items/{item_id}/Ancestors?api_key=[APIKEY]"
+            )
+            status_code = getattr(response, "status_code", 200)
+            if status_code != 200:
+                return False
+            payload = response.json() if hasattr(response, "json") else response
+            if isinstance(payload, dict):
+                payload = payload.get("Items") or payload.get("Ancestors") or []
+            if not isinstance(payload, list):
+                return False
+            for ancestor in payload:
+                if not isinstance(ancestor, dict):
+                    continue
+                ancestor_id = str(ancestor.get("Id") or ancestor.get("id") or "")
+                ancestor_name = str(
+                    ancestor.get("Name") or ancestor.get("name") or ""
+                ).casefold()
+                if ancestor_id in selected_ids or ancestor_name in selected_names:
+                    return True
+        except Exception as err:
+            logger.warning(
+                "查询 Emby 媒体库祖先关系失败：server=%s, item=%s, error=%s",
+                server_name,
+                item_id,
+                err,
+            )
+        return False
+
+    @staticmethod
+    def _library_server_from_key(value: str) -> str:
+        """从媒体库配置值中取出服务器名。"""
+        return str(value).partition("::")[0].strip()
+
+    @staticmethod
+    def _library_id_from_key(value: str) -> str:
+        """从媒体库配置值中取出 Emby 媒体库 ID。"""
+        return str(value).partition("::")[2].strip()
+
+    def _audit_roots(
+        self, stop_event: Optional[threading.Event] = None
+    ) -> List[Tuple[Path, List[str]]]:
+        """返回审计根目录及对应实例，库路径为空时按媒体库 ID 查询条目路径。"""
         roots: Dict[str, Dict[str, Any]] = {}
         if self._audit_libraries:
             catalog = self._load_library_catalog()
             for key in self._audit_libraries:
-                library = catalog.get(key)
-                if not library:
-                    continue
-                for path in library.get("paths") or []:
+                library = catalog.get(key) or {
+                    "server": self._library_server_from_key(key),
+                    "id": self._library_id_from_key(key),
+                    "paths": [],
+                }
+                paths = list(library.get("paths") or [])
+                recovered_paths = []
+                if not paths or not any(Path(path).exists() for path in paths):
+                    recovered_paths = self._emby_library_item_paths(
+                        library["server"], library["id"], stop_event
+                    )
+                paths = list(dict.fromkeys(paths + recovered_paths))
+                for path in paths:
                     state = roots.setdefault(
                         self._state_key(Path(path)), {"path": path, "servers": set()}
                     )
@@ -246,6 +398,94 @@ class EmbyMediaImageManager(_PluginBase):
         return [
             (Path(state["path"]), sorted(state["servers"])) for state in roots.values()
         ]
+
+    def _emby_library_item_paths(
+        self,
+        server_name: str,
+        library_id: str,
+        stop_event: Optional[threading.Event] = None,
+    ) -> List[str]:
+        """媒体库对象没有 path 时，从 Emby 条目列表恢复本地媒体路径。"""
+        if not library_id or (stop_event and stop_event.is_set()):
+            return []
+        include_types = []
+        if self._movie_enabled:
+            include_types.append("Movie")
+        if self._tv_enabled:
+            include_types.append("Series")
+        if not include_types:
+            return []
+        try:
+            services = (
+                MediaServerHelper().get_services(
+                    type_filter="emby", name_filters=[server_name]
+                )
+                or {}
+            )
+            service = services.get(server_name)
+            instance = getattr(service, "instance", None) if service else None
+            if not instance or not hasattr(instance, "get_data"):
+                return []
+            response = instance.get_data(
+                url=(
+                    f"[HOST]emby/Users/[USER]/Items?ParentId={library_id}"
+                    f"&Recursive=true&IncludeItemTypes={','.join(include_types)}"
+                    "&Fields=Path,Type&Limit=100000&api_key=[APIKEY]"
+                )
+            )
+            status_code = getattr(response, "status_code", 200)
+            if status_code != 200:
+                logger.warning(
+                    "读取 Emby 媒体库条目失败：server=%s, library=%s, status=%s",
+                    server_name,
+                    library_id,
+                    status_code,
+                )
+                return []
+            payload = response.json() if hasattr(response, "json") else response
+            items = payload.get("Items", []) if isinstance(payload, dict) else payload
+            if not isinstance(items, list):
+                return []
+            paths: Dict[str, str] = {}
+            for item in items:
+                if stop_event and stop_event.is_set():
+                    break
+                if not isinstance(item, dict):
+                    continue
+                target = self._library_item_target_path(item)
+                if target:
+                    paths.setdefault(self._state_key(Path(target)), target)
+            logger.info(
+                "从 Emby 条目恢复媒体库路径：server=%s, library=%s, count=%s",
+                server_name,
+                library_id,
+                len(paths),
+            )
+            return list(paths.values())
+        except Exception as err:
+            logger.warning(
+                "从 Emby 条目恢复媒体库路径失败：server=%s, library=%s, error=%s",
+                server_name,
+                library_id,
+                err,
+            )
+            return []
+
+    @staticmethod
+    def _library_item_target_path(item: dict) -> str:
+        """把 Emby 电影/剧集条目的 Path 归一为可扫描目录。"""
+        raw_path = str(item.get("Path") or item.get("path") or "").strip()
+        if not raw_path:
+            return ""
+        item_type = str(item.get("Type") or item.get("type") or "").casefold()
+        path = Path(raw_path)
+        extensions = {
+            str(extension).casefold()
+            for extension in getattr(settings, "RMT_MEDIAEXT", [])
+        }
+        if item_type == "movie" and path.suffix.casefold() in extensions:
+            path = path.parent
+        return str(path)
 
     @staticmethod
     def _library_field(value: Any, key: str, default: Any = None) -> Any:
@@ -860,14 +1100,17 @@ class EmbyMediaImageManager(_PluginBase):
         if item_type not in {"Movie", "Episode", "Series"}:
             return
         raw_path = str(item.get("Path") or info.item_path or "").strip()
-        library_selected, library_paths = self._selected_library_paths(server_name)
-        in_library = any(self._is_under(raw_path, root) for root in library_paths)
         in_legacy_paths = self._path_allowed(raw_path, self._realtime_paths)
         if (
             not raw_path
             or self._is_excluded(raw_path)
-            or (library_selected and (not library_paths or not in_library))
-            or (not library_selected and not in_legacy_paths)
+            or (
+                self._realtime_libraries
+                and not self._event_matches_selected_libraries(
+                    server_name, raw_path, item, info
+                )
+            )
+            or (not self._realtime_libraries and not in_legacy_paths)
         ):
             return
         if item_type == "Movie" and not self._movie_enabled:
@@ -980,7 +1223,7 @@ class EmbyMediaImageManager(_PluginBase):
             logger.warning("审计状态数据格式异常，已重建为空状态")
             states = {}
         try:
-            roots = self._audit_roots()
+            roots = self._audit_roots(stop_event)
             if not roots:
                 skip_reason = "未配置媒体库或审计目录，未执行扫描"
                 logger.warning("未配置媒体库或审计目录，跳过图片审计")

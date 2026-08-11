@@ -3,42 +3,38 @@
 
 import argparse
 import copy
+import hashlib
 import json
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from app.helper.mediaserver import MediaServerHelper
+try:
+    from app.helper.mediaserver import MediaServerHelper
+except ImportError:  # 允许在宿主外执行 --help，实际操作仍需 MoviePilot 环境。
+    MediaServerHelper = None
 
 
 BACKUP_ROOT = Path("/config/temp/embychineserolesync-cleanup")
-KNOWN_MAPPINGS = {
-    "斯特林角": {
-        "series_id": "166037",
-        "people": {
-            "166061": {"canonical_id": "166048", "name": "雅各布·怀特达克-拉瓦"},
-            "166062": {"canonical_id": "166050", "name": "基恩·鲁法洛"},
-            "166063": {"canonical_id": "166051", "name": "博·布拉加森"},
-        },
-    },
-    "聪明镇": {
-        "series_id": "165917",
-        "people": {
-            "166068": {"canonical_id": "165923", "name": "陈妍霏"},
-            "166069": {"canonical_id": "165926", "name": "郑炜龄"},
-            "166070": {"canonical_id": "165927", "name": "许曦文"},
-        },
-    },
-}
+
+
+def plan_digest(plan: dict) -> str:
+    """计算不包含自身摘要字段的稳定计划摘要。"""
+    payload = {key: value for key, value in plan.items() if key != "plan_digest"}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 class KnownDuplicateCleaner:
     """为已人工确认的重复人物生成快照并安全替换媒体关系。"""
 
-    def __init__(self, server_name: str):
+    def __init__(self, server_name: str, mappings: Dict[str, dict]):
         """初始化媒体服务器。"""
+        if MediaServerHelper is None:
+            raise RuntimeError("该维护工具必须在 MoviePilot 宿主 Python 环境中运行")
         self.server_name = server_name
+        self.mappings = mappings
         self.service = MediaServerHelper().get_services(name_filters=[server_name]).get(server_name)
         if not self.service:
             raise RuntimeError(f"未找到媒体服务器：{server_name}")
@@ -118,7 +114,7 @@ class KnownDuplicateCleaner:
             "targets": [],
             "errors": [],
         }
-        for title, config in KNOWN_MAPPINGS.items():
+        for title, config in self.mappings.items():
             for duplicate_id, item in config["people"].items():
                 canonical = self.get_item(item["canonical_id"])
                 duplicate = self.get_item(duplicate_id)
@@ -154,20 +150,30 @@ class KnownDuplicateCleaner:
                         "before_people": before,
                         "after_people": after,
                     })
+        plan["plan_digest"] = plan_digest(plan)
         return plan
 
     def apply(self, plan: dict) -> dict:
         """比对快照后先更新原 Person，再替换媒体 People 关系。"""
         result = {"person_updated": [], "targets_updated": [], "skipped": [], "failed": []}
+        blocked_titles = set()
         for update in plan.get("person_updates", []):
             current = self.get_item(update["canonical_id"])
             if current != update["before"]:
                 result["skipped"].append({"id": update["canonical_id"], "reason": "Person 已变化"})
+                blocked_titles.add(str(update.get("title") or ""))
             elif self.update_item(update["canonical_id"], update["after"]):
                 result["person_updated"].append(update["canonical_id"])
             else:
                 result["failed"].append(update["canonical_id"])
+                blocked_titles.add(str(update.get("title") or ""))
         for target in plan.get("targets", []):
+            if str(target.get("title") or "") in blocked_titles:
+                result["skipped"].append({
+                    "id": target["item_id"],
+                    "reason": "依赖的 canonical Person 未安全更新",
+                })
+                continue
             current = self.get_item(target["item_id"])
             if (current.get("People", []) or []) != target["before_people"]:
                 result["skipped"].append({"id": target["item_id"], "reason": "People 已变化"})
@@ -191,11 +197,12 @@ def save_json(path: Path, payload: dict) -> None:
 def main() -> int:
     """生成或应用已确认重复人物清理计划。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", default="115")
+    parser.add_argument("--server", required=True, help="MoviePilot 媒体服务器名称（必须显式指定）")
+    parser.add_argument("--mapping", help="人工确认的映射 JSON 文件，生成计划时必须显式提供")
     parser.add_argument("--plan")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--confirm", help="应用计划时必须提供计划摘要（plan_digest）")
     args = parser.parse_args()
-    cleaner = KnownDuplicateCleaner(args.server)
     if args.apply:
         if not args.plan:
             raise SystemExit("--apply 必须提供 --plan")
@@ -203,11 +210,24 @@ def main() -> int:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
         if plan.get("errors"):
             raise SystemExit("计划存在错误，拒绝执行")
+        if plan.get("server") != args.server:
+            raise SystemExit("计划所属服务器与 --server 不一致，拒绝跨服应用")
+        digest = plan_digest(plan)
+        if not args.confirm or args.confirm != digest or plan.get("plan_digest") != digest:
+            raise SystemExit(f"需要 --confirm {digest} 才能应用该计划")
+        cleaner = KnownDuplicateCleaner(args.server, {})
         result = cleaner.apply(plan)
         result_path = plan_path.with_name(plan_path.stem + "-result.json")
         save_json(result_path, result)
         print(json.dumps({"result_path": str(result_path), **result}, ensure_ascii=False, indent=2))
         return 1 if result["failed"] or result["skipped"] else 0
+    if not args.mapping:
+        raise SystemExit("生成计划必须提供 --mapping，工具不会使用内置人物或服务器 ID")
+    mapping_path = Path(args.mapping)
+    mappings = json.loads(mapping_path.read_text(encoding="utf-8"))
+    if not isinstance(mappings, dict) or not mappings:
+        raise SystemExit("--mapping 必须是非空 JSON 对象")
+    cleaner = KnownDuplicateCleaner(args.server, mappings)
     plan = cleaner.build_plan()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     plan_path = Path(args.plan) if args.plan else BACKUP_ROOT / f"known-duplicates-plan-{stamp}.json"
@@ -217,6 +237,7 @@ def main() -> int:
         "person_updates": len(plan["person_updates"]),
         "target_updates": len(plan["targets"]),
         "errors": plan["errors"],
+        "plan_digest": plan.get("plan_digest"),
     }, ensure_ascii=False, indent=2))
     return 1 if plan["errors"] else 0
 

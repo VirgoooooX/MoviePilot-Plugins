@@ -4,21 +4,27 @@
 import argparse
 import copy
 import json
-import os
 import re
 import sys
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from app.helper.mediaserver import MediaServerHelper
-from app.modules.themoviedb import TmdbApi
-from app.plugins.embychineserolesync import EmbyChineseRoleSync
-from app.schemas.types import MediaType
-from app.utils.zhconv import convert as zhconv_convert
+try:
+    from app.helper.mediaserver import MediaServerHelper
+    from app.modules.themoviedb import TmdbApi
+    from app.plugins.embychineserolesync import EmbyChineseRoleSync
+    from app.schemas.types import MediaType
+    from app.utils.zhconv import convert as zhconv_convert
+except ImportError:  # 允许在宿主外执行 --help，实际操作仍需 MoviePilot 环境。
+    MediaServerHelper = TmdbApi = EmbyChineseRoleSync = MediaType = None
+
+    def zhconv_convert(value: str, target: str) -> str:
+        """宿主缺失时保留原文，便于只读参数帮助。"""
+        return value
 
 
-LOG_PATH = Path("/config/logs/plugins/embychineserolesync.log")
 BACKUP_ROOT = Path("/config/temp/embychineserolesync-cleanup")
 ADDITION_PATTERN = re.compile(r"<(.+?)> 按开关补充豆瓣演员 \d+ 人：(.*)$")
 SEASON_SUFFIX_PATTERN = re.compile(r"-第\s*\d+\s*季$")
@@ -32,6 +38,13 @@ def normalize_name(name: object) -> str:
         return zhconv_convert(text, "zh-hans")
     except Exception:
         return text
+
+
+def plan_digest(plan: dict) -> str:
+    """计算不包含自身摘要字段的稳定计划摘要。"""
+    payload = {key: value for key, value in plan.items() if key != "plan_digest"}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def provider_id(item: Optional[dict], provider: str) -> Optional[str]:
@@ -61,6 +74,8 @@ class Cleaner:
 
     def __init__(self, server_name: str):
         """初始化 Emby 服务和 TMDB 客户端。"""
+        if MediaServerHelper is None:
+            raise RuntimeError("该维护工具必须在 MoviePilot 宿主 Python 环境中运行")
         self.server_name = server_name
         self.service = MediaServerHelper().get_services(name_filters=[server_name]).get(server_name)
         if not self.service:
@@ -74,7 +89,8 @@ class Cleaner:
         """读取 Emby 条目完整信息。"""
         response = self.service.instance.get_data(
             url=f"[HOST]emby/Users/[USER]/Items/{item_id}?X-Emby-Token=[APIKEY]"
-                "&Fields=ChannelMappingInfo&ExcludeFields=Chapters,MediaSources,MediaStreams,Subviews"
+                "&Fields=ChannelMappingInfo,People,ProviderIds,LockedFields"
+                "&ExcludeFields=Chapters,MediaSources,MediaStreams,Subviews"
         )
         return response.json() if response and response.status_code == 200 else {}
 
@@ -365,12 +381,12 @@ class Cleaner:
                 kept.append(relation)
         return kept, removed
 
-    def build_plan(self, additions: Dict[str, Set[str]]) -> dict:
+    def build_plan(self, additions: Dict[str, Set[str]], source_log: Optional[Path] = None) -> dict:
         """生成不写入 Emby 的完整清理计划和写前快照。"""
         plan = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "server": self.server_name,
-            "source_log": str(LOG_PATH),
+            "source_log": str(source_log) if source_log else "",
             "media": [],
             "errors": [],
         }
@@ -422,6 +438,7 @@ class Cleaner:
                 plan["media"].append(media_plan)
             except Exception as error:
                 plan["errors"].append({"title": title, "error": str(error)})
+        plan["plan_digest"] = plan_digest(plan)
         return plan
 
     def apply_plan(self, plan: dict) -> dict:
@@ -455,13 +472,13 @@ def save_json(path: Path, payload: dict) -> None:
 def main() -> int:
     """运行只读计划或显式应用清理。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", default="115", help="MoviePilot 媒体服务器名称")
-    parser.add_argument("--log", default=str(LOG_PATH), help="事故日志路径")
+    parser.add_argument("--server", required=True, help="MoviePilot 媒体服务器名称（必须显式指定）")
+    parser.add_argument("--log", required=False, help="事故日志路径；生成计划时必须显式提供")
     parser.add_argument("--plan", help="计划/备份 JSON 路径")
     parser.add_argument("--apply", action="store_true", help="应用已有计划，默认只生成计划")
+    parser.add_argument("--confirm", help="应用计划时必须提供计划摘要（plan_digest）")
     args = parser.parse_args()
 
-    cleaner = Cleaner(args.server)
     if args.apply:
         if not args.plan:
             raise SystemExit("--apply 必须同时提供 --plan")
@@ -469,17 +486,26 @@ def main() -> int:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
         if plan.get("errors"):
             raise SystemExit("计划包含错误，拒绝应用")
+        if plan.get("server") != args.server:
+            raise SystemExit("计划所属服务器与 --server 不一致，拒绝跨服应用")
+        digest = plan_digest(plan)
+        if not args.confirm or args.confirm != digest or plan.get("plan_digest") != digest:
+            raise SystemExit(f"需要 --confirm {digest} 才能应用该计划")
+        cleaner = Cleaner(args.server)
         result = cleaner.apply_plan(plan)
         result_path = plan_path.with_name(plan_path.stem + "-result.json")
         save_json(result_path, result)
         print(json.dumps({"result_path": str(result_path), **result}, ensure_ascii=False, indent=2))
         return 1 if result.get("failed") or result.get("skipped") else 0
 
+    if not args.log:
+        raise SystemExit("生成计划必须提供 --log，工具不会猜测日志位置")
+    cleaner = Cleaner(args.server)
     log_path = Path(args.log)
     additions = parse_additions(log_path)
-    if len(additions) != 19:
-        raise SystemExit(f"事故媒体数量应为 19，实际为 {len(additions)}，拒绝生成可执行计划")
-    plan = cleaner.build_plan(additions)
+    if not additions:
+        raise SystemExit("日志中没有识别到可清理的追加关系，拒绝生成计划")
+    plan = cleaner.build_plan(additions, log_path)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     plan_path = Path(args.plan) if args.plan else BACKUP_ROOT / f"cleanup-plan-{timestamp}.json"
     save_json(plan_path, plan)
@@ -494,6 +520,7 @@ def main() -> int:
             for target in media.get("targets", [])
         ),
         "errors": plan.get("errors", []),
+        "plan_digest": plan.get("plan_digest"),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 1 if plan.get("errors") else 0

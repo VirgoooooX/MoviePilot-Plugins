@@ -5,7 +5,9 @@ import json
 import queue
 import difflib
 import threading
+import traceback
 import unicodedata
+from dataclasses import dataclass, field
 from dateutil.parser import isoparse
 from datetime import datetime, timedelta
 from typing import Any, List, Dict, Tuple, Optional
@@ -17,6 +19,7 @@ from app.log import logger
 from app.core.cache import Cache
 from app.core.config import settings
 from app.core.event import eventmanager, Event
+import app.plugins as plugin_runtime_host
 from app.plugins import _PluginBase
 from app.utils.string import StringUtils
 from app.utils.zhconv import convert as zhconv_convert
@@ -27,7 +30,76 @@ from app.schemas.types import EventType, MediaType
 from app.helper.mediaserver import MediaServerHelper
 
 
+_RUNTIME_ATTRIBUTE = "_embychineserolesync_runtime_v1"
+_EMBY_ROLE_RUNTIME = getattr(plugin_runtime_host, _RUNTIME_ATTRIBUTE, None)
+if not isinstance(_EMBY_ROLE_RUNTIME, dict):
+    # 挂在稳定的 MoviePilot app.plugins 模块上，插件模块重载后仍能看见旧线程。
+    _EMBY_ROLE_RUNTIME = {
+        "scheduler": None,
+        "queue": queue.Queue(),
+        "state_lock": threading.RLock(),
+        "inflight": set(),
+        "service_lock": threading.RLock(),
+        "worker_thread": None,
+        "worker_stop_event": threading.Event(),
+        "scan_stop_event": threading.Event(),
+        "queue_put_lock": threading.Lock(),
+        "run_lock": threading.Lock(),
+        "managed_lock_fields": {},
+    }
+    setattr(plugin_runtime_host, _RUNTIME_ATTRIBUTE, _EMBY_ROLE_RUNTIME)
+
+
+@dataclass
+class SyncResult:
+    """表示单个媒体同步任务的结构化结果。"""
+
+    success: bool
+    item_id: Optional[str] = None
+    message: str = ""
+    skipped: bool = False
+    changed: bool = False
+    errors: List[str] = field(default_factory=list)
+
+    def as_dict(self) -> Dict[str, Any]:
+        """将同步结果转换为 API 与日志可用的字典。"""
+        return {
+            "success": self.success,
+            "item_id": self.item_id,
+            "message": self.message,
+            "skipped": self.skipped,
+            "changed": self.changed,
+            "errors": list(self.errors),
+        }
+
+    @classmethod
+    def ok(
+        cls,
+        item_id: Optional[str] = None,
+        message: str = "同步成功",
+        skipped: bool = False,
+        changed: bool = False,
+    ) -> "SyncResult":
+        """构造成功或安全跳过的结果。"""
+        return cls(True, item_id, message, skipped=skipped, changed=changed)
+
+    @classmethod
+    def failed(
+        cls,
+        item_id: Optional[str] = None,
+        message: str = "同步失败",
+        errors: Optional[List[str]] = None,
+    ) -> "SyncResult":
+        """构造失败结果并限制错误摘要内容。"""
+        error_list = [str(error)[:300] for error in (errors or []) if error]
+        if not error_list:
+            error_list = [message[:300]]
+        return cls(False, item_id, message, errors=error_list)
+
+
 class EmbyChineseRoleSync(_PluginBase):
+    """同步豆瓣中文演职人员信息到 Emby，并提供安全的预演与队列处理。"""
+
     # 插件名称
     plugin_name = "Emby中文角色同步"
     # 插件描述
@@ -35,7 +107,7 @@ class EmbyChineseRoleSync(_PluginBase):
     # 插件图标
     plugin_icon = "actor.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     plugin_label = "媒体服务器,元数据"
     # 插件作者
     plugin_author = "xiaoQQya, VirgoooooX"
@@ -59,6 +131,8 @@ class EmbyChineseRoleSync(_PluginBase):
     _sync_episodes = False
     _refresh_episodes = True
     _overwrite_episode_people = False
+    _lock_person_name = False
+    _lock_media_cast = False
     _search_keyword = ""
 
     # 前端交互脚本：在开启的媒体库内检索匹配（接收当前表单 model，供输入防抖、回车与搜索按钮共用）
@@ -124,43 +198,119 @@ class EmbyChineseRoleSync(_PluginBase):
     model.search_feedback = '同步失败：' + ((err && err.message) ? err.message : String(err));
   }
 }"""
+    # 前端交互脚本：只读预演首个勾选媒体，不执行任何 Emby 写入
+    _PREVIEW_BTN_JS = """async (event) => {
+  const sel = model.search_matches_selected || [];
+  if (!sel.length) {
+    model.search_feedback = '请先勾选要预演的媒体';
+    return;
+  }
+  const raw = String(sel[0]);
+  const idx = raw.indexOf(':');
+  const payload = idx > 0 ? { server: raw.slice(0, idx), item_id: raw.slice(idx + 1) } : { server: '', item_id: raw };
+  model.search_feedback = '正在生成只读预演…';
+  try {
+    const res = await window.MoviePilotAPI.post('plugin/__PLUGIN_ID__/preview_media', payload);
+    model.search_feedback = (res && res.message) ? res.message : '预演完成';
+  } catch (err) {
+    model.search_feedback = '预演失败：' + ((err && err.message) ? err.message : String(err));
+  }
+}"""
 
-    _scheduler = None
+    _scheduler = _EMBY_ROLE_RUNTIME["scheduler"]
     _tmdbapi = TmdbApi()
     _doubanapi = DoubanApi()
     _cache = Cache("ttl", 2000, 7 * 24 * 60 * 60)
-    _queue = queue.Queue()
-    _state_lock = threading.RLock()
-    _inflight = set()
+    _queue = _EMBY_ROLE_RUNTIME["queue"]
+    _state_lock = _EMBY_ROLE_RUNTIME["state_lock"]
+    _inflight = _EMBY_ROLE_RUNTIME["inflight"]
+    _service_lock = _EMBY_ROLE_RUNTIME["service_lock"]
+    _worker_thread = _EMBY_ROLE_RUNTIME["worker_thread"]
+    _worker_stop_event = _EMBY_ROLE_RUNTIME["worker_stop_event"]
+    _scan_stop_event = _EMBY_ROLE_RUNTIME["scan_stop_event"]
+    _queue_put_lock = _EMBY_ROLE_RUNTIME["queue_put_lock"]
+    _run_lock = _EMBY_ROLE_RUNTIME["run_lock"]
+    _managed_lock_fields = _EMBY_ROLE_RUNTIME["managed_lock_fields"]
 
-    def init_plugin(self, config: Optional[dict] = None):
+
+    def _bind_runtime_state(self) -> None:
+        """绑定跨模块重载共享的队列、线程和互斥对象。"""
+        runtime = _EMBY_ROLE_RUNTIME
+        self._runtime = runtime
+        self._scheduler = runtime.get("scheduler")
+        self._queue = runtime["queue"]
+        self._state_lock = runtime["state_lock"]
+        self._inflight = runtime["inflight"]
+        self._service_lock = runtime["service_lock"]
+        self._worker_thread = runtime.get("worker_thread")
+        self._worker_stop_event = runtime["worker_stop_event"]
+        self._scan_stop_event = runtime["scan_stop_event"]
+        self._queue_put_lock = runtime["queue_put_lock"]
+        self._run_lock = runtime["run_lock"]
+        self._managed_lock_fields = runtime["managed_lock_fields"]
+
+
+    def init_plugin(self, config: Optional[dict] = None) -> None:
+        """根据插件配置初始化服务，并仅在启用时启动后台线程。"""
+        self._bind_runtime_state()
         self.stop_service()
+        if self._worker_thread and self._worker_thread.is_alive():
+            logger.error("旧的 Emby 演职人员后台线程仍在退出，拒绝并发启动")
+            self._enabled = False
+            return
 
-        if config:
-            self._enabled = config.get("enabled")
-            self._clearcache = config.get("clearcache")
-            self._onlyonce = config.get("onlyonce")
-            self._mediaservers = config.get("mediaservers") or []
-            self._include_libraries = config.get("include_libraries") or []
-            self._num = config.get("num")
-            self._cron = config.get("cron") or "0 6 * * *"
-            self._sync_episodes = bool(config.get("sync_episodes", False))
-            self._refresh_episodes = bool(config.get("refresh_episodes", True))
-            self._overwrite_episode_people = bool(config.get("overwrite_episode_people", False))
-            self._search_keyword = str(config.get("search_keyword") or "").strip()
+        config = config or {}
+        self._enabled = bool(config.get("enabled", False))
+        self._clearcache = bool(config.get("clearcache", False))
+        self._onlyonce = bool(config.get("onlyonce", False))
+        self._mediaservers = config.get("mediaservers") or []
+        self._include_libraries = config.get("include_libraries") or []
+        self._num = config.get("num") or 3
+        self._cron = config.get("cron") or "0 6 * * *"
+        self._sync_episodes = bool(config.get("sync_episodes", False))
+        self._refresh_episodes = bool(config.get("refresh_episodes", True))
+        self._overwrite_episode_people = bool(config.get("overwrite_episode_people", False))
+        self._search_keyword = str(config.get("search_keyword") or "").strip()
+        # 旧配置没有新开关时保留历史锁定行为；新表单会明确写入安全默认 False。
+        legacy_config = bool(config) and "lock_person_name" not in config and "lock_media_cast" not in config
+        self._lock_person_name = bool(config.get("lock_person_name", legacy_config))
+        self._lock_media_cast = bool(config.get("lock_media_cast", legacy_config))
 
         if self._clearcache:
             logger.info("Emby 演职人员缓存清除")
             self._cache.clear(self.plugin_config_prefix.rstrip("_"))
             self._clearcache = False
 
-        self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-        self._scheduler.add_job(
-            func=self.handle_hook,
-            trigger="date",
-            run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=1),
-            name="Emby 演职人员增强媒体入库处理"
+        if not self._enabled:
+            self.update_config({
+                "enabled": False,
+                "clearcache": False,
+                "onlyonce": False,
+                "mediaservers": self._mediaservers,
+                "include_libraries": self._include_libraries,
+                "num": self._num,
+                "cron": self._cron,
+                "sync_episodes": self._sync_episodes,
+                "refresh_episodes": self._refresh_episodes,
+                "overwrite_episode_people": self._overwrite_episode_people,
+                "lock_person_name": self._lock_person_name,
+                "lock_media_cast": self._lock_media_cast,
+                "search_keyword": self._search_keyword,
+            })
+            logger.info("Emby 演职人员增强插件未启用，不启动调度器和队列线程")
+            return
+
+        self._worker_stop_event.clear()
+        self._scan_stop_event.clear()
+        self._worker_thread = threading.Thread(
+            target=self.handle_hook,
+            name="emby-chinese-role-sync-worker",
+            daemon=True,
         )
+        self._runtime["worker_thread"] = self._worker_thread
+        self._worker_thread.start()
+        self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+        self._runtime["scheduler"] = self._scheduler
         self._scheduler.start()
 
         if self._onlyonce:
@@ -184,6 +334,8 @@ class EmbyChineseRoleSync(_PluginBase):
             "sync_episodes": self._sync_episodes,
             "refresh_episodes": self._refresh_episodes,
             "overwrite_episode_people": self._overwrite_episode_people,
+            "lock_person_name": self._lock_person_name,
+            "lock_media_cast": self._lock_media_cast,
             "search_keyword": self._search_keyword
         })
 
@@ -229,6 +381,14 @@ class EmbyChineseRoleSync(_PluginBase):
                 "auth": "bear",
                 "summary": "手动同步单部影视剧演职人员",
                 "description": "按Emby Item ID单独同步指定影视剧的角色与演职人员"
+            },
+            {
+                "path": "/preview_media",
+                "endpoint": self.api_preview_media,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "只读预演单部影视剧同步计划",
+                "description": "识别与匹配中文演职人员并统计将要变更的字段，不执行任何 Emby 写入、锁定或图片刷新"
             },
             {
                 "path": "/sync_media_batch",
@@ -319,23 +479,33 @@ class EmbyChineseRoleSync(_PluginBase):
         return options
 
     def _is_library_allowed(self, mediaserver: ServiceInfo, media: dict) -> bool:
-        """检查媒体条目是否在允许的媒体库中"""
+        """检查媒体条目是否在允许的媒体库中，白名单查询异常时拒绝处理。"""
         if not self._include_libraries:
             return True
         item_id = media.get("Id")
         if not item_id:
-            return True
+            logger.warning("媒体条目缺少 Id，无法验证白名单，已按安全策略跳过")
+            return False
         url = f"[HOST]emby/Items/{item_id}/Ancestors?api_key=[APIKEY]"
-        res = mediaserver.instance.get_data(url=url)
-        if res and res.status_code == 200:
+        try:
+            res = mediaserver.instance.get_data(url=url)
+            if not res or res.status_code != 200:
+                status = getattr(res, "status_code", "无响应")
+                logger.warning(f"媒体 <{media.get('Name') or item_id}> Ancestors 查询失败（HTTP {status}），白名单按 fail-closed 处理")
+                return False
             ancestors = res.json()
+            if not isinstance(ancestors, list):
+                logger.warning(f"媒体 <{media.get('Name') or item_id}> Ancestors 响应格式异常，白名单按 fail-closed 处理")
+                return False
             for anc in ancestors:
-                if anc.get("Name") in self._include_libraries:
+                if isinstance(anc, dict) and anc.get("Name") in self._include_libraries:
                     return True
             if media.get("Name") in self._include_libraries:
                 return True
             return False
-        return True
+        except Exception as exc:
+            logger.error(f"媒体 <{media.get('Name') or item_id}> Ancestors 查询异常，白名单按 fail-closed 处理：{exc}\n{traceback.format_exc()}")
+            return False
 
     def api_libraries(self) -> Dict[str, Any]:
         """API: 获取媒体库列表"""
@@ -421,6 +591,8 @@ class EmbyChineseRoleSync(_PluginBase):
 
     def api_sync_media(self, item_id: str, server: str) -> Dict[str, Any]:
         """API: 按 Emby Item ID 同步指定剧集演职人员（受到允许媒体库白名单限制）"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用，拒绝执行 Emby 写入"}
         if not item_id or not server:
             return {"success": False, "message": "缺少必要参数 item_id 或 server"}
         service = self.service_infos.get(server) if self.service_infos else None
@@ -435,14 +607,152 @@ class EmbyChineseRoleSync(_PluginBase):
             return {"success": False, "message": f"作品 <{item_info.get('Name')}> 不在开启同步的媒体库中，已被排除"}
 
         try:
-            self._handle_single_item(service, item_info)
+            result = self._handle_single_item(service, item_info)
+            if not result.success:
+                return {"success": False, "message": result.message or "同步失败", "data": result.as_dict()}
             return {"success": True, "message": f"<{item_info.get('Name')}> 演职人员角色中文同步成功！"}
         except Exception as e:
-            logger.exception(f"手动同步 {item_info.get('Name')} 失败")
+            logger.error(f"手动同步 {item_info.get('Name')} 失败：{e}\n{traceback.format_exc()}")
             return {"success": False, "message": f"同步失败: {str(e)}"}
+
+    def _preview_target_plan(
+        self,
+        mediaserver: ServiceInfo,
+        series_info: dict,
+        media_type: MediaType,
+        target_info: Optional[dict] = None,
+    ) -> dict:
+        """构建单个电影或季度的只读中文角色预演计划。"""
+        target = target_info or series_info
+        media_name = target.get("Name") or series_info.get("Name") or "未知媒体"
+        peoples = target.get("People") or []
+        douban_info = self._get_douban_info(media_type, series_info, target_info)
+        if not douban_info:
+            return {
+                "media": media_name,
+                "error": "未获取到匹配的豆瓣演职人员信息",
+                "existing_people_count": len(peoples),
+                "would_change_count": 0,
+                "would_lock_count": 0,
+            }
+        plan = self._build_chinese_role_plan(mediaserver, peoples, douban_info, media_name)
+        actions = plan.get("actions") or []
+        changed_actions = [
+            action for action in actions if action.get("name_changed") or action.get("role_changed")
+        ]
+        lock_count = 0
+        if self._lock_person_name:
+            lock_count += sum(1 for action in changed_actions if action.get("name_changed"))
+        if self._lock_media_cast and changed_actions:
+            lock_count += 1
+        return {
+            "media": media_name,
+            "existing_people_count": plan.get("existing_people_count", len(peoples)),
+            "douban_actor_count": plan.get("douban_actor_count", 0),
+            "would_change_count": len(changed_actions),
+            "would_lock_count": lock_count,
+            "unmatched_count": len(plan.get("unmatched") or []),
+            "ambiguous_count": len(plan.get("ambiguous") or []),
+            "conflict_count": len(plan.get("conflicts") or []),
+            "safe_to_apply": bool(plan.get("safe_to_apply")),
+            "changes": [
+                {
+                    "name": action.get("target_name"),
+                    "from_name": action.get("current_name"),
+                    "from_role": action.get("current_role"),
+                    "to_role": action.get("target_role"),
+                }
+                for action in changed_actions[:100]
+            ],
+        }
+
+    def _build_preview_plan(self, mediaserver: ServiceInfo, item_info: dict) -> dict:
+        """构建单部影视剧的只读预演摘要，整个流程不调用 Emby 写接口。"""
+        item_type = item_info.get("Type")
+        if item_type == "Movie":
+            return {
+                "item_id": str(item_info.get("Id") or ""),
+                "title": item_info.get("Name") or "未知电影",
+                "type": "Movie",
+                "targets": [self._preview_target_plan(mediaserver, item_info, MediaType.MOVIE)],
+            }
+        if item_type != "Series":
+            return {
+                "item_id": str(item_info.get("Id") or ""),
+                "title": item_info.get("Name") or "未知媒体",
+                "type": item_type,
+                "targets": [{"media": item_info.get("Name"), "error": f"暂不支持的 Emby 类型：{item_type}"}],
+            }
+        series_id = item_info.get("Id")
+        url = f"[HOST]emby/Users/[USER]/Items?ParentId={series_id}&api_key=[APIKEY]&IncludeItemTypes=Season&Recursive=true"
+        response = mediaserver.instance.get_data(url=url)
+        seasons = []
+        try:
+            if response and response.status_code == 200:
+                seasons = response.json().get("Items", []) or []
+        except Exception as exc:
+            logger.error(f"<{item_info.get('Name')}> 预演季度列表解析失败：{exc}\n{traceback.format_exc()}")
+        targets = []
+        for season in seasons:
+            season_info = self._get_item_info(mediaserver, season.get("Id"))
+            if season_info:
+                targets.append(self._preview_target_plan(mediaserver, item_info, MediaType.TV, season_info))
+            else:
+                targets.append({"media": season.get("Name"), "error": "无法读取季度信息"})
+        if not targets:
+            targets.append(self._preview_target_plan(mediaserver, item_info, MediaType.TV))
+        return {
+            "item_id": str(series_id or ""),
+            "title": item_info.get("Name") or "未知电视剧",
+            "type": "Series",
+            "targets": targets,
+        }
+
+    def api_preview_media(self, payload: Dict[str, Any] = None) -> Dict[str, Any]:
+        """API：只读预演单部媒体的识别、匹配和将变更统计。"""
+        payload = payload or {}
+        item_id = str(payload.get("item_id") or "").strip()
+        server = str(payload.get("server") or "").strip()
+        if not item_id or not server:
+            return {"success": False, "message": "缺少必要参数 item_id 或 server"}
+        service = self.service_infos.get(server) if self.service_infos else None
+        if not service:
+            return {"success": False, "message": f"未找到已连接的服务器 {server}"}
+        item_info = self._get_item_info(service, item_id)
+        if not item_info:
+            return {"success": False, "message": f"未找到 ID 为 {item_id} 的媒体项目"}
+        if not self._is_library_allowed(service, item_info):
+            return {"success": False, "message": f"作品 <{item_info.get('Name')}> 不在开启的媒体库中，已被排除"}
+        try:
+            plan = self._build_preview_plan(service, item_info)
+        except Exception as exc:
+            logger.error(f"预演 <{item_info.get('Name')}> 失败：{exc}\n{traceback.format_exc()}")
+            return {"success": False, "message": f"预演失败：{exc}"}
+        targets = plan.get("targets") or []
+        errors = [target.get("error") for target in targets if target.get("error")]
+        would_change = sum(int(target.get("would_change_count") or 0) for target in targets)
+        would_lock = sum(int(target.get("would_lock_count") or 0) for target in targets)
+        message = f"只读预演完成：预计变更 {would_change} 项"
+        if would_lock:
+            message += f"，预计新增锁定 {would_lock} 项"
+        if errors:
+            message += f"；{len(errors)} 个目标无法完成匹配"
+        return {
+            "success": not errors,
+            "message": message,
+            "data": {
+                **plan,
+                "dry_run": True,
+                "would_change_count": would_change,
+                "would_lock_count": would_lock,
+                "errors": errors,
+            },
+        }
 
     def api_sync_media_batch(self, payload: Dict[str, Any] = None) -> Dict[str, Any]:
         """API: 批量同步设置页勾选的多部影视剧演职人员（受到允许媒体库白名单限制）"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用，拒绝执行 Emby 写入"}
         items = (payload or {}).get("items") or []
         if not items:
             return {"success": False, "message": "未选择任何媒体"}
@@ -469,10 +779,13 @@ class EmbyChineseRoleSync(_PluginBase):
                 fail_items.append({"name": item_info.get("Name") or item_id, "reason": "不在允许处理的媒体库中，已排除"})
                 continue
             try:
-                self._handle_single_item(service, item_info)
-                ok_items.append(item_info.get("Name") or item_id)
+                result = self._handle_single_item(service, item_info)
+                if result.success:
+                    ok_items.append(item_info.get("Name") or item_id)
+                else:
+                    fail_items.append({"name": item_info.get("Name") or item_id, "reason": result.message or "同步失败"})
             except Exception as e:
-                logger.exception(f"批量同步 <{item_info.get('Name') or item_id}> 失败")
+                logger.error(f"批量同步 <{item_info.get('Name') or item_id}> 失败：{e}\n{traceback.format_exc()}")
                 fail_items.append({"name": item_info.get("Name") or item_id, "reason": str(e)})
 
         message = f"🎯 同步完成：成功 {len(ok_items)} 部"
@@ -488,6 +801,8 @@ class EmbyChineseRoleSync(_PluginBase):
 
     def api_sync_media_by_name(self, search_keyword: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """API: 接收输入框中的剧名，在开启的 Emby 库中搜索匹配并立刻同步演职人员"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用，拒绝执行 Emby 写入"}
         keyword = search_keyword or kwargs.get("search_keyword") or self._search_keyword
         keyword = str(keyword or "").strip()
         if not keyword:
@@ -529,13 +844,15 @@ class EmbyChineseRoleSync(_PluginBase):
             return {"success": False, "message": f"获取作品信息失败 (ID: {item_id})"}
 
         try:
-            self._handle_single_item(service, item_info)
+            result = self._handle_single_item(service, item_info)
+            if not result.success:
+                return {"success": False, "message": f"匹配到 <{item_name}> 但同步失败: {result.message}", "data": result.as_dict()}
             return {
                 "success": True,
                 "message": f"🎯 已在开启的 [{lib}] 中匹配到 <{item_name}> ({year})，演职人员与中文角色已同步成功！"
             }
         except Exception as e:
-            logger.exception(f"精准同步 <{item_name}> 失败")
+            logger.error(f"精准同步 <{item_name}> 失败：{e}\n{traceback.format_exc()}")
             return {"success": False, "message": f"匹配到 <{item_name}> 但同步失败: {str(e)}"}
 
     def api_run_now(self) -> Dict[str, Any]:
@@ -593,19 +910,20 @@ class EmbyChineseRoleSync(_PluginBase):
         history = history[:60]
         self.save_data("history", history)
 
-    def _handle_single_item(self, mediaserver: ServiceInfo, item_info: dict):
-        """处理单部电影或整部电视剧的手动精准同步"""
+    def _handle_single_item(self, mediaserver: ServiceInfo, item_info: dict) -> SyncResult:
+        """处理单部电影或整部电视剧，并汇总每个季/集的结果。"""
         item_type = item_info.get("Type")
         if item_type == "Movie":
-            self._handle_media(mediaserver, item_info)
+            return self._handle_media(mediaserver, item_info)
         elif item_type == "Series":
             series_id = item_info.get("Id")
             url = f"[HOST]emby/Users/[USER]/Items?ParentId={series_id}&api_key=[APIKEY]&IncludeItemTypes=Season&Recursive=true"
             res = mediaserver.instance.get_data(url=url)
             seasons = res.json().get("Items", []) if res and res.status_code == 200 else []
+            results: List[SyncResult] = []
             if not seasons:
                 pseudo_media = {"Id": series_id, "Type": "Episode", "SeriesId": series_id, "SeriesName": item_info.get("Name"), "Name": item_info.get("Name")}
-                self._handle_media(mediaserver, pseudo_media)
+                results.append(self._handle_media(mediaserver, pseudo_media))
             else:
                 for season in seasons:
                     season_id = season.get("Id")
@@ -614,7 +932,7 @@ class EmbyChineseRoleSync(_PluginBase):
                     episodes = ep_res.json().get("Items", []) if ep_res and ep_res.status_code == 200 else []
                     if episodes:
                         media = episodes[0]
-                        self._handle_media(mediaserver, media)
+                        results.append(self._handle_media(mediaserver, media))
                     else:
                         pseudo_media = {
                             "Id": season_id,
@@ -625,13 +943,25 @@ class EmbyChineseRoleSync(_PluginBase):
                             "SeasonName": season.get("Name"),
                             "Name": season.get("Name")
                         }
-                        self._handle_media(mediaserver, pseudo_media)
+                        results.append(self._handle_media(mediaserver, pseudo_media))
+            failures = [result for result in results if not result.success]
+            if failures:
+                errors = [result.message for result in failures if result.message]
+                return SyncResult.failed(
+                    item_id=str(series_id) if series_id else None,
+                    message=f"{item_info.get('Name') or series_id} 有 {len(failures)} 个同步任务失败",
+                    errors=errors,
+                )
+            return SyncResult.ok(
+                item_id=str(series_id) if series_id else None,
+                message=f"{item_info.get('Name') or series_id} 同步完成（{len(results)} 个任务）",
+                changed=any(result.changed for result in results),
+            )
+        return SyncResult.failed(item_id=str(item_info.get("Id") or ""), message=f"暂不支持的 Emby 类型：{item_type}")
 
     @eventmanager.register(EventType.WebhookMessage)
     def hook(self, event: Event):
-        """
-        监听媒体入库事件
-        """
+        """监听媒体入库事件并将符合白名单的条目加入队列。"""
         if not self._enabled:
             return
 
@@ -660,24 +990,37 @@ class EmbyChineseRoleSync(_PluginBase):
             logger.info(f"<{media.get('Name')}> 不在允许的媒体库列表中，跳过处理")
             return
 
-        self._queue.put((mediaserver, media))
+        with self._queue_put_lock:
+            if self._worker_stop_event.is_set() or self._scan_stop_event.is_set():
+                logger.info(f"<{media.get('Name')}> 插件正在停止，忽略新的 Webhook 任务")
+                return
+            self._queue.put((mediaserver, media))
 
-    def handle_hook(self):
-        """
-        处理媒体入库事件
-        """
+    def handle_hook(self) -> None:
+        """在独立线程中消费媒体队列，单项失败只记录并继续。"""
+        active_queue = self._queue
         logger.info("媒体入库事件 webhook 处理启动")
         while True:
-            item = self._queue.get()
+            try:
+                item = active_queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._worker_stop_event.is_set():
+                    break
+                continue
             try:
                 if item is None:
                     break
+                if self._worker_stop_event.is_set():
+                    # 停止阶段取消尚未开始的任务，避免旧队列在下次启动继续写入 Emby。
+                    continue
                 mediaserver, media = item
-                self._handle_media(mediaserver, media)
-            except Exception:
-                logger.exception("处理媒体入库任务异常")
+                result = self._handle_media(mediaserver, media)
+                if not result.success:
+                    logger.error(f"处理媒体入库任务失败：{result.message}")
+            except Exception as exc:
+                logger.error(f"处理媒体入库任务异常：{exc}\n{traceback.format_exc()}")
             finally:
-                self._queue.task_done()
+                active_queue.task_done()
         logger.info("媒体入库事件 webhook 处理停止")
 
     @property
@@ -708,37 +1051,66 @@ class EmbyChineseRoleSync(_PluginBase):
         return active_services
 
     def run(self) -> None:
-        if not self.service_infos:
+        """执行定时全量扫描，避免多个扫描任务并发重入。"""
+        if not self._enabled:
+            logger.info("Emby 演职人员增强插件未启用，跳过定时扫描")
             return
+        if self._scan_stop_event.is_set():
+            logger.info("全量扫描已收到停止信号，跳过本次运行")
+            return
+        if not self._run_lock.acquire(blocking=False):
+            logger.warning("已有全量扫描任务运行中，跳过重复触发")
+            return
+        try:
+            services = self.service_infos
+            if not services:
+                logger.warning("没有可用媒体服务器，跳过本次全量扫描")
+                return
 
-        for name, service in self.service_infos.items():
-            logger.info(f"开始获取媒体服务器 {name} 最近 {self._num} 天的媒体数据")
-            medias = self._get_latest_medias(service)
-            logger.info(f"获取媒体服务器 {name} 最近 {self._num} 天的媒体数据共 {len(medias)} 条")
+            for name, service in services.items():
+                if self._scan_stop_event.is_set():
+                    logger.info("全量扫描收到停止信号，取消后续媒体入队")
+                    break
+                logger.info(f"开始获取媒体服务器 {name} 最近 {self._num} 天的媒体数据")
+                medias = self._get_latest_medias(service)
+                logger.info(f"获取媒体服务器 {name} 最近 {self._num} 天的媒体数据共 {len(medias)} 条")
 
-            filtered_count = 0
-            for media in medias:
-                if self._is_library_allowed(service, media):
-                    self._queue.put((service, media))
-                    filtered_count += 1
+                filtered_count = 0
+                for media in medias:
+                    if self._scan_stop_event.is_set():
+                        break
+                    if self._is_library_allowed(service, media):
+                        with self._queue_put_lock:
+                            if self._scan_stop_event.is_set():
+                                break
+                            self._queue.put((service, media))
+                            filtered_count += 1
 
-            logger.info(f"媒体服务器 {name} 过滤后入队处理条数: {filtered_count}")
-            self._queue.join()
+                logger.info(f"媒体服务器 {name} 过滤后入队处理条数: {filtered_count}")
+                if not self._scan_stop_event.is_set():
+                    self._queue.join()
 
-            logger.info(f"媒体服务器 {name} 演职人员增强完成")
+                logger.info(f"媒体服务器 {name} 演职人员增强完成")
+        finally:
+            self._run_lock.release()
 
-    def _handle_media(self, mediaserver: ServiceInfo, media: dict):
-        """统一处理单个媒体事件并确保同一任务释放互斥状态。"""
+    def _handle_media(self, mediaserver: ServiceInfo, media: dict) -> SyncResult:
+        """统一处理单个媒体事件并返回结构化结果，确保释放互斥状态。"""
         task_key = f"{mediaserver.name}:{media.get('SeasonId') or media.get('SeriesId') or media.get('Id')}"
         with self._state_lock:
             if task_key in self._inflight:
                 logger.info(f"<{media.get('Name')}> 任务正在处理中，跳过重复触发")
-                return
+                return SyncResult.ok(str(media.get("Id") or ""), "任务正在处理中，跳过重复触发", skipped=True)
             self._inflight.add(task_key)
         try:
-            self._handle_media_impl(mediaserver, media)
-        except Exception:
-            logger.exception(f"<{media.get('Name')}> 媒体处理失败")
+            result = self._handle_media_impl(mediaserver, media)
+            if isinstance(result, SyncResult):
+                return result
+            logger.warning(f"<{media.get('Name')}> 媒体处理未返回明确结果，按失败处理")
+            return SyncResult.failed(str(media.get("Id") or ""), "媒体处理未返回明确结果")
+        except Exception as exc:
+            logger.error(f"<{media.get('Name')}> 媒体处理失败：{exc}\n{traceback.format_exc()}")
+            return SyncResult.failed(str(media.get("Id") or ""), f"媒体处理失败：{exc}")
         finally:
             with self._state_lock:
                 self._inflight.discard(task_key)
@@ -762,13 +1134,13 @@ class EmbyChineseRoleSync(_PluginBase):
             handled_episodes = self._cache.get(key, region) or []
             if str(episode_id) in {str(item) for item in handled_episodes}:
                 logger.info(f"<{media_name}> 单集已成功处理，跳过重复同步")
-                return
+                return SyncResult.ok(str(episode_id), f"<{media_name}> 单集已成功处理，跳过重复同步", skipped=True)
 
         # 获取系列元信息
         series_info = self._get_item_info(mediaserver, series_id)
         if not series_info:
             logger.warning(f"<{series_name}> 获取系列元信息失败，请检查配置")
-            return
+            return SyncResult.failed(str(series_id), f"<{series_name}> 获取系列元信息失败")
 
         # 获取季元信息
         season_info = None
@@ -776,20 +1148,22 @@ class EmbyChineseRoleSync(_PluginBase):
             season_info = self._get_item_info(mediaserver, season_id)
             if not season_info:
                 logger.warning(f"<{series_name}-{season_name}> 获取季元信息失败，请检查配置")
-                return
+                return SyncResult.failed(str(season_id), f"<{series_name}-{season_name}> 获取季元信息失败")
 
             season_info = self._update_season_credits(mediaserver, series_info, season_info)
             if not season_info:
-                return
+                return SyncResult.failed(str(season_id), f"<{series_name}-{season_name}> 更新季演职人员失败")
 
         # 演职人员角色信息中文
         series_info, season_info = self._update_chinese_role(mediaserver, media_type, series_info, season_info)
         if not series_info:
-            return
+            return SyncResult.failed(str(series_id), f"<{media_name}> 中文角色同步失败或匹配存在冲突")
 
         # 更新系列演职人员信息
         if media_type == MediaType.TV and season_info:
             series_info = self._update_tv_credits(mediaserver, series_info, season_info)
+            if not series_info:
+                return SyncResult.failed(str(series_id), f"<{series_name}> 系列演职人员更新失败")
 
         roles_synced = len(series_info.get("People") or [])
 
@@ -797,6 +1171,12 @@ class EmbyChineseRoleSync(_PluginBase):
         if media_type == MediaType.TV and self._sync_episodes:
             sync_result = self._sync_series_episodes(mediaserver, series_info, season_info)
             if sync_result:
+                if sync_result.get("failed"):
+                    return SyncResult.failed(
+                        str(series_id),
+                        f"<{series_name}> 有 {len(sync_result.get('failed') or [])} 集同步失败",
+                        errors=[str(item) for item in sync_result.get("failed") or []],
+                    )
                 handled_episodes = self._cache.get(key, region) if self._cache.exists(key, region) else []
                 handled_episodes = handled_episodes or []
                 for synced_id in sync_result.get("succeeded", []):
@@ -816,6 +1196,36 @@ class EmbyChineseRoleSync(_PluginBase):
         )
 
         time.sleep(3)
+        return SyncResult.ok(str(series_id), f"<{media_name}> 同步成功", changed=True)
+
+    def _set_managed_lock(
+        self,
+        item_info: dict,
+        field: str,
+        enabled: bool,
+        server_identity: Optional[str] = None,
+    ) -> None:
+        """按开关增删当前服务本次新增的锁字段，并保留未知用户锁。"""
+        if not isinstance(item_info, dict) or not field:
+            return
+        if "LockedFields" not in item_info or not isinstance(item_info.get("LockedFields"), list):
+            logger.warning(f"<{item_info.get('Name') or item_info.get('Id')}> 缺少可靠 LockedFields，跳过锁字段变更")
+            return
+        item_id = str(item_info.get("Id") or "")
+        identity = str(server_identity or getattr(self, "_lock_server_identity", "local") or "local")
+        ownership_key = f"{identity}:{item_id}" if item_id else ""
+        locked = item_info.get("LockedFields")
+        owned = self._managed_lock_fields.setdefault(ownership_key, set()) if ownership_key else set()
+        if enabled:
+            if field not in locked:
+                locked.append(field)
+                if ownership_key:
+                    owned.add(field)
+        elif ownership_key and field in owned and field in locked:
+            # 只移除当前实例明确添加过的字段；旧配置或用户原有锁不作猜测性解锁。
+            locked.remove(field)
+            owned.discard(field)
+        item_info["LockedFields"] = locked
 
     def _sync_series_episodes(self, mediaserver: ServiceInfo, series_info: dict, season_info: Optional[dict]):
         """将电视剧或当前季度的中文演职人员同步到单集并按需刷新。"""
@@ -828,13 +1238,18 @@ class EmbyChineseRoleSync(_PluginBase):
             status = getattr(res, "status_code", "无响应")
             body = getattr(res, "text", "")[:200] if res else ""
             logger.warning(f"<{series_info.get('Name')}> 获取单集列表失败，HTTP {status}：{body}")
-            return {"succeeded": [], "failed": []}
-        episodes = res.json().get("Items", [])
+            return {"succeeded": [], "failed": [f"获取单集列表失败（HTTP {status}）"]}
+        try:
+            episodes = res.json().get("Items", [])
+        except Exception as exc:
+            logger.error(f"<{series_info.get('Name')}> 单集列表响应解析失败：{exc}\n{traceback.format_exc()}")
+            return {"succeeded": [], "failed": ["单集列表响应解析失败"]}
         logger.info(f"<{series_info.get('Name')}> 开始逐集同步，共 {len(episodes)} 集")
         result = {"succeeded": [], "failed": []}
         for episode in episodes:
             episode_info = self._get_item_info(mediaserver, episode.get("Id"))
             if not episode_info:
+                result["failed"].append(episode.get("Id") or "未知单集")
                 continue
             source_people = season_info.get("People", []) if season_info else series_info.get("People", [])
             current_people = episode_info.get("People") or []
@@ -853,9 +1268,7 @@ class EmbyChineseRoleSync(_PluginBase):
                         target["Name"] = person.get("Name") or target.get("Name")
                         target["Role"] = person.get("Role")
                 episode_info["People"] = list(by_identity.values())
-            locked = episode_info.setdefault("LockedFields", [])
-            if "Cast" not in locked:
-                locked.append("Cast")
+            self._set_managed_lock(episode_info, "Cast", self._lock_media_cast, getattr(mediaserver, "name", None))
             episode_id = episode_info.get("Id")
             if self._update_item_info(mediaserver, episode_id, episode_info):
                 result["succeeded"].append(episode_id)
@@ -889,9 +1302,9 @@ class EmbyChineseRoleSync(_PluginBase):
 
     def _get_item_info(self, mediaserver: ServiceInfo, item_id: int):
         """
-        获取单个项目详情
+        获取单个项目详情，并显式请求 People、ProviderIds 与 LockedFields。
         """
-        url = f"[HOST]emby/Users/[USER]/Items/{item_id}?X-Emby-Token=[APIKEY]&Fields=ChannelMappingInfo&ExcludeFields=Chapters,MediaSources,MediaStreams,Subviews"
+        url = f"[HOST]emby/Users/[USER]/Items/{item_id}?X-Emby-Token=[APIKEY]&Fields=ChannelMappingInfo,People,ProviderIds,LockedFields&ExcludeFields=Chapters,MediaSources,MediaStreams,Subviews"
         res = mediaserver.instance.get_data(url=url)
         if res and res.status_code == 200:
             return res.json()
@@ -967,8 +1380,7 @@ class EmbyChineseRoleSync(_PluginBase):
                 continue
             peoples.append(people)
         season_info["People"] = peoples
-        if "Cast" not in season_info.setdefault("LockedFields", []):
-            season_info["LockedFields"].append("Cast")
+        self._set_managed_lock(season_info, "Cast", self._lock_media_cast, getattr(mediaserver, "name", None))
 
         if self._update_item_info(mediaserver, item_id, season_info):
             logger.info(f"<{media_name}> 季演职人员信息更新成功")
@@ -1048,8 +1460,7 @@ class EmbyChineseRoleSync(_PluginBase):
 
         updated_series_peoples = [merged[key] for key in order]
         series_info["People"] = updated_series_peoples
-        if "Cast" not in series_info.setdefault("LockedFields", []):
-            series_info["LockedFields"].append("Cast")
+        self._set_managed_lock(series_info, "Cast", self._lock_media_cast, getattr(mediaserver, "name", None))
         if self._update_item_info(mediaserver, item_id, series_info):
             logger.info(f"<{series_name}> 系列演职人员信息更新成功")
             return series_info
@@ -1243,9 +1654,7 @@ class EmbyChineseRoleSync(_PluginBase):
                     logger.warning(f"人员 <{people.get('Name')}> 无法读取 Person 实体，跳过姓名更新")
                 else:
                     person_info["Name"] = action.get("target_name")
-                    locked = person_info.setdefault("LockedFields", [])
-                    if "Name" not in locked:
-                        locked.append("Name")
+                    self._set_managed_lock(person_info, "Name", self._lock_person_name, getattr(mediaserver, "name", None))
                     if not self._update_item_info(mediaserver, person_id, person_info):
                         logger.warning(f"人员 <{people.get('Name')}> Person 实体中文姓名更新失败")
                         return None, None
@@ -1253,8 +1662,7 @@ class EmbyChineseRoleSync(_PluginBase):
             people["Name"] = action.get("target_name") or people.get("Name")
             people["Role"] = action.get("target_role")
 
-        if "Cast" not in target_info.setdefault("LockedFields", []):
-            target_info["LockedFields"].append("Cast")
+        self._set_managed_lock(target_info, "Cast", self._lock_media_cast, getattr(mediaserver, "name", None))
         if not self._update_item_info(mediaserver, target_info["Id"], target_info):
             logger.warning(f"<{media_name}> 媒体演职人员角色中文更新失败")
             return None, None
@@ -1309,6 +1717,7 @@ class EmbyChineseRoleSync(_PluginBase):
     @staticmethod
     def sequence_matcher(s1: str, s2: str) -> float:
         def normalize(text):
+            """规范化待比较标题中的空格与中文数字。"""
             if text is None:
                 return ""
 
@@ -1326,6 +1735,7 @@ class EmbyChineseRoleSync(_PluginBase):
         return difflib.SequenceMatcher(None, normalize(s1), normalize(s2)).ratio()
 
     def get_state(self) -> bool:
+        """返回插件当前启用状态。"""
         return self._enabled
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -1346,6 +1756,7 @@ class EmbyChineseRoleSync(_PluginBase):
         plugin_id = self.__class__.__name__
         search_body_js = self._SEARCH_BODY_JS.replace("__PLUGIN_ID__", plugin_id)
         sync_button_js = self._SYNC_BTN_JS.replace("__PLUGIN_ID__", plugin_id)
+        preview_button_js = self._PREVIEW_BTN_JS.replace("__PLUGIN_ID__", plugin_id)
 
         return [
             {
@@ -1373,7 +1784,10 @@ class EmbyChineseRoleSync(_PluginBase):
                                                             section_title("mdi-power", "运行与控制", "管理插件基础开关与全量运行策略"),
                                                             {'component': 'VSwitch', 'props': {'model': 'enabled', 'label': '启用插件', 'color': 'primary', 'inset': True, 'class': 'mb-2'}},
                                                             {'component': 'VSwitch', 'props': {'model': 'clearcache', 'label': '清除缓存后运行', 'color': 'primary', 'inset': True, 'class': 'mb-2'}},
-                                                            {'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即全量运行一次', 'color': 'primary', 'inset': True}}
+                                                            {'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即全量运行一次', 'color': 'primary', 'inset': True}},
+                                                            {'component': 'VSwitch', 'props': {'model': 'lock_person_name', 'label': '锁定人物中文姓名（Name）', 'color': 'warning', 'inset': True, 'class': 'mt-2'}},
+                                                            {'component': 'VSwitch', 'props': {'model': 'lock_media_cast', 'label': '锁定媒体演职人员（Cast）', 'color': 'warning', 'inset': True}},
+                                                            {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'density': 'compact', 'class': 'mt-3', 'text': '仅在开关开启且字段由本次运行新增时管理锁定；关闭后不会猜测性解锁旧配置或用户原有锁。'} }
                                                         ]
                                                     }
                                                 ]
@@ -1563,7 +1977,7 @@ class EmbyChineseRoleSync(_PluginBase):
                                                 'content': [
                                                     {
                                                         'component': 'VCol',
-                                                        'props': {'cols': 12, 'md': 9},
+                                                        'props': {'cols': 12, 'md': 6},
                                                         'content': [
                                                             {
                                                                 'component': 'VSelect',
@@ -1602,6 +2016,24 @@ class EmbyChineseRoleSync(_PluginBase):
                                                                 'text': '同步所选媒体'
                                                             }
                                                         ]
+                                                    },
+                                                    {
+                                                        'component': 'VCol',
+                                                        'props': {'cols': 12, 'md': 3},
+                                                        'content': [
+                                                            {
+                                                                'component': 'VBtn',
+                                                                'props': {
+                                                                    'color': 'info',
+                                                                    'variant': 'tonal',
+                                                                    'block': True,
+                                                                    'height': '44',
+                                                                    'prepend-icon': 'mdi-eye-outline',
+                                                                    'onClick': preview_button_js
+                                                                },
+                                                                'text': '只读预演'
+                                                            }
+                                                        ]
                                                     }
                                                 ]
                                             },
@@ -1635,6 +2067,8 @@ class EmbyChineseRoleSync(_PluginBase):
             "sync_episodes": False,
             "refresh_episodes": True,
             "overwrite_episode_people": False,
+            "lock_person_name": False,
+            "lock_media_cast": False,
             "search_keyword": "",
             "search_matches": [],
             "search_matches_selected": [],
@@ -1849,15 +2283,52 @@ class EmbyChineseRoleSync(_PluginBase):
             }
         ]
 
-    def stop_service(self):
-        """
-        退出插件
-        """
-        if self._scheduler and self._scheduler.running:
-            self._queue.put(None)
-            self._scheduler.shutdown()
+    def stop_service(self) -> None:
+        """停止调度器与队列线程，保留未能及时退出的线程引用避免重入。"""
+        if not hasattr(self, "_runtime"):
+            self._bind_runtime_state()
+        runtime = self._runtime
+        with self._service_lock:
+            scheduler = runtime.get("scheduler")
+            runtime["scheduler"] = None
+            self._scheduler = None
+            if scheduler:
+                try:
+                    scheduler.shutdown(wait=False)
+                except Exception as exc:
+                    logger.error(f"关闭 Emby 演职人员调度器失败：{exc}\n{traceback.format_exc()}")
 
-        self._queue = queue.Queue()
-        with self._state_lock:
-            self._inflight.clear()
-        self._scheduler = None
+            worker = runtime.get("worker_thread")
+            self._worker_thread = worker
+            if worker and worker.is_alive():
+                self._worker_stop_event.set()
+                # 与扫描入队使用同一把锁，确保停止哨兵不会被旧扫描追加的任务越过。
+                with self._queue_put_lock:
+                    self._scan_stop_event.set()
+                    self._queue.put(None)
+                worker.join(timeout=5)
+                if worker.is_alive():
+                    logger.warning("Emby 演职人员队列线程未在 5 秒内退出，将保留引用并拒绝并发启动")
+                    return
+            else:
+                self._scan_stop_event.set()
+
+            # worker 已退出后再等待全量扫描释放锁，避免重置队列导致旧 run 永久 join。
+            with self._run_lock:
+                pass
+            # 理论上队列应已由 worker 收口；再次清理竞态残留并为每项标记完成，避免下次启动复用旧任务。
+            with self._queue_put_lock:
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    else:
+                        self._queue.task_done()
+            self._worker_thread = None
+            runtime["worker_thread"] = None
+            self._worker_stop_event.clear()
+            # 始终保留原队列对象，确保没有并发扫描引用到被替换的队列。
+            self._scan_stop_event.clear()
+            with self._state_lock:
+                self._inflight.clear()

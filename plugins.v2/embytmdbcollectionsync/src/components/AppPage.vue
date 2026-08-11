@@ -32,26 +32,36 @@ async function saveConfig() {
     const response = await props.api.post(`${base.value}/config`, config.value)
     status.value = unwrapResponse(response) || status.value
     config.value = cloneConfig(status.value.config || config.value)
+    error.value = ''
+    return true
   } catch (err) { error.value = err?.message || '保存失败' } finally { saving.value = false }
+  return false
 }
 
 // 启动只读预演。
 async function scan() {
-  await saveConfig()
-  try { await props.api.post(`${base.value}/scan`, {}); await loadStatus() } catch (err) { error.value = err?.message || '预演启动失败' }
+  // 保存失败时不得继续扫描，避免使用页面上未落盘的服务器或电影库范围。
+  if (!await saveConfig()) return false
+  try { unwrapResponse(await props.api.post(`${base.value}/scan`, {})); await loadStatus() } catch (err) { error.value = err?.message || '预演启动失败' }
+  return !error.value
 }
 
 // 执行用户审核并选择的计划。
 async function apply(payload) {
-  try { await props.api.post(`${base.value}/apply`, payload); await loadStatus() } catch (err) { error.value = err?.message || '执行启动失败' }
+  try { unwrapResponse(await props.api.post(`${base.value}/apply`, payload)); await loadStatus(); return true } catch (err) { error.value = err?.message || '执行启动失败'; return false }
+}
+
+// 请求取消扫描或执行任务。
+async function cancel() {
+  try { unwrapResponse(await props.api.post(`${base.value}/cancel`, {})); await loadStatus(); return true } catch (err) { error.value = err?.message || '取消任务失败'; return false }
 }
 
 defineExpose({ loadStatus, saveConfig, loading, saving })
-onMounted(async () => { await loadStatus(true); timer = window.setInterval(() => { if (status.value?.job?.running) loadStatus(false) }, 2500) })
+onMounted(async () => { await loadStatus(true); timer = window.setInterval(() => { if (status.value?.job?.running || status.value?.job?.busy) loadStatus(false) }, 2500) })
 onBeforeUnmount(() => timer && window.clearInterval(timer))
 </script>
 
 <template>
   <VAlert v-if="error" type="error" variant="tonal" class="ma-4" :text="error" />
-  <CollectionManager :status="status" :config="config" :loading="loading" :saving="saving" :hide-title="hideTitle" @refresh="loadStatus" @save="saveConfig" @scan="scan" @apply="apply" />
+  <CollectionManager :status="status" :config="config" :loading="loading" :saving="saving" :hide-title="hideTitle" @refresh="loadStatus" @save="saveConfig" @scan="scan" @apply="apply" @cancel="cancel" />
 </template>

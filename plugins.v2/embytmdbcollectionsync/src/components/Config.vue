@@ -20,7 +20,7 @@ onMounted(() => { config.value = cloneConfig(props.initialConfig); status.value.
       <VSwitch v-model="config.overwrite_images" label="更新已接管合集的封面和徽标" color="primary" />
       <VSwitch v-model="config.sync_logo" label="同步合集徽标" color="primary" />
       <VSwitch v-model="config.delete_empty" label="删除插件管理的空合集" color="primary" />
-      <VAlert type="info" variant="tonal" text="服务器、电影库选择和变更审核请在插件侧栏工作台中完成。" />
+      <VAlert type="info" variant="tonal" text="服务器、电影库选择和变更审核请在插件侧栏工作台中完成；合集图片只使用 TMDB，支持 zh-CN、zh-SG、zh-TW、zh-HK 地区标签。" />
     </VCardText>
   </div>
 </template>

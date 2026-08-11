@@ -63,6 +63,14 @@ def validate_assets(path: Path, assets: frozenset[str]) -> list[str]:
     return errors
 
 
+def logical_asset_roles(assets: frozenset[str]) -> frozenset[str]:
+    """移除 Vite 内容哈希，只比较联邦入口引用的逻辑资产角色。"""
+    return frozenset(
+        re.sub(r"-[A-Za-z0-9_-]+(?=\.(?:js|css)$)", "", asset)
+        for asset in assets
+    )
+
+
 def main() -> int:
     if not REMOTE_ENTRY.is_file():
         print(f"Remote entry validation failed: missing {REMOTE_ENTRY}")
@@ -73,7 +81,7 @@ def main() -> int:
     errors: list[str] = []
 
     if committed != generated:
-        for field in ("exposes", "assets", "exports"):
+        for field in ("exposes", "exports"):
             old = getattr(committed, field)
             new = getattr(generated, field)
             if old != new:
@@ -81,6 +89,13 @@ def main() -> int:
                     f"remote entry {field} changed: committed={sorted(old)!r}, "
                     f"generated={sorted(new)!r}"
                 )
+        old_roles = logical_asset_roles(committed.assets)
+        new_roles = logical_asset_roles(generated.assets)
+        if old_roles != new_roles:
+            errors.append(
+                "remote entry logical assets changed: "
+                f"committed={sorted(old_roles)!r}, generated={sorted(new_roles)!r}"
+            )
 
     required_exports = {"dynamicLoadingCss", "get", "init"}
     if not required_exports.issubset(generated.exports):

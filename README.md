@@ -24,6 +24,7 @@
 - **单集同步与刷新策略**：支持将演职人员同步至每集，可配置覆盖已有演职人员及同步后非递归刷新单集元数据。
 - **队列解耦与并发防重**：Webhook 实时入库与定时扫描统一进入后台队列，配合去重缓存与锁机制避免重复处理。
 - **便捷控制与 REST API**：提供全量同步、精准同步、清去重缓存与清历史记录等 API 及快捷按钮。
+- **只读预演与安全锁定**：同步前可查看预计姓名、角色和锁字段变更；人物姓名与媒体 Cast 锁定改为独立开关，新安装默认不锁定。
 
 #### 配置说明
 
@@ -39,11 +40,14 @@
 | 同步每集演职人员 | 将电视剧/季度的演员角色同步到各单集 |
 | 同步后刷新单集 | 写入演职人员后调用 Emby 单集刷新 |
 | 覆盖单集已有演职人员 | 是否覆盖单集现有演职人员列表 |
+| 锁定人物中文姓名 | 是否为本次新增的人物中文姓名写入 `LockedFields.Name`（新安装默认关闭） |
+| 锁定媒体演职人员 | 是否为本次更新的媒体写入 `LockedFields.Cast`（新安装默认关闭） |
 | 指定影视剧检索同步 | 输入剧名或 Item ID 实时检索作品，勾选后点击【同步所选媒体】 |
+| 只读预演 | 对当前选中媒体执行识别与匹配，仅统计预计变更，不写入 Emby |
 
 #### 当前版本
 
-`v1.0.1`
+`v1.1.0`
 
 ### 天空监控（HdskyMonitor）
 
@@ -158,6 +162,7 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 #### 主要功能
 
 - **按优先级选海报**：在元数据写入前拦截图片补全流程，根据自定义的来源与语言顺序筛选最佳主海报。
+- **中文地区标签兼容**：同时识别 TMDB 的复合地区标签与语言/地区分字段返回，支持 `zh-CN`、`zh-SG`、`zh-TW`、`zh-HK` 及旧版泛 `zh` 回退。
 - **可配置候选层与自由禁用**：支持在 Vuetify 配置界面中灵活调整候选层顺序或直接移除禁用特定候选层。
 - **背景图与 Logo 联动**：在选择主海报的同时，自动选择同次 TMDB 请求所得的背景图（backdrop）与标志图（logo）。
 - **线程池与选择缓存**：支持异步调用与单轮选择缓存机制，保证高并发入库时不阻塞识别且避免重复 API 请求。
@@ -167,11 +172,11 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 | 配置项 | 说明 |
 | --- | --- |
 | 启用插件 | 控制入库前海报优先选择服务是否运行 |
-| 海报候选优先级 | 配置海报匹配层级的顺序与启用项（默认 `TMDB zh-CN` → `TMDB zh-SG` → `Fanart Chinese` → `TMDB 源语言` → `TMDB en-US` → `Fanart English` → `TMDB null`） |
+| 海报候选优先级 | 配置海报匹配层级的顺序与启用项（默认依次为 TMDB `zh-CN`、`zh-SG`、`zh-TW`、`zh-HK`、泛 `zh`，再到 Fanart 中文、源语言、TMDB `en-US`、泛 `en`、Fanart 英文和 `null`） |
 
 #### 当前版本
 
-`v1.0.1`
+`v1.1.0`
 
 ### Emby TMDB 合集整理（EmbyTmdbCollectionSync）
 
@@ -182,10 +187,11 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 #### 主要功能
 
 - **TMDB 官方合集比对预演**：读取 Emby 电影库中的 TMDB ID，按 TMDB 官方 Collection 规则自动预演与组建合集。
-- **接管审核与手动调整**：支持逐合集预演预览、成员校正与接管审核，并能自动复用或新建同名合集。
-- **封面与徽标自动同步**：检索并上传中文优先的 TMDB 合集海报（Poster）与徽标（Logo），支持配置覆盖已有图片。
+- **接管审核与安全执行**：支持逐合集预演、成员校正与接管审核；执行前绑定计划 ID、配置指纹并复核 Emby 成员快照，过期计划不会继续写入。
+- **封面与徽标自动同步**：检索并上传中文地区优先的 TMDB 合集海报（Poster）与徽标（Logo），支持配置覆盖已有图片。
 - **空合集自动清理**：支持清理整理后不包含任何电影的空合集，保持 Emby 合集列表干练整洁。
-- **独立 Vue 面板与侧栏导航**：提供独立的 Vue 动态渲染界面与侧边栏“Emby 合集整理”入口，支持实时任务进度监控与阶段心跳展示。
+- **响应式合集工作台**：合集由单行列表升级为海报卡片网格，按屏幕宽度显示一至三列，并以详情对话框承载完整增删清单。
+- **任务互斥与取消**：扫描、执行和配置保存互相保护，支持查看真实忙碌状态并安全请求取消后台任务。
 
 #### 配置说明
 
@@ -201,7 +207,7 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.0.1`
+`v1.1.0`
 
 ## 目录结构
 
@@ -234,8 +240,12 @@ plugins.v2/
 └── tmdbposterlanguagepriority/
     └── __init__.py
 tests/
+├── embychineserolesync/
+├── embytmdbcollectionsync/
 ├── hdskymonitor/
 └── tmdbposterlanguagepriority/
+tools/
+└── maintenance/embychineserolesync/
 ```
 
 ## 开发校验
@@ -251,7 +261,7 @@ npm run build --prefix plugins.v2/embytmdbcollectionsync
 git diff --check
 ```
 
-`TmdbPosterLanguagePriority` 的完整测试依赖 MoviePilot 宿主；独立仓库环境会自动跳过该测试模块，宿主环境中应再运行一次真实加载验证。
+三个插件的核心逻辑测试会安装最小宿主桩并在独立仓库环境实际执行；发布前仍应在 MoviePilot 宿主中做一次安装、页面加载与 API 冒烟验证。
 
 ## 免责声明
 

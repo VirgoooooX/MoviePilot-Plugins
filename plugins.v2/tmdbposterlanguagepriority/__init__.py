@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi.concurrency import run_in_threadpool
@@ -22,7 +23,7 @@ class TmdbPosterLanguagePriority(_PluginBase):
     plugin_name = "TMDB/Fanart 海报优先"
     plugin_desc = "按来源与语言优先级选择媒体海报。"
     plugin_icon = "fullscreenposterwall.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     plugin_label = "元数据,海报"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
@@ -33,18 +34,37 @@ class TmdbPosterLanguagePriority(_PluginBase):
     DEFAULT_PRIORITY = [
         "tmdb_zh_cn",
         "tmdb_zh_sg",
+        "tmdb_zh_tw",
+        "tmdb_zh_hk",
+        "tmdb_zh",
         "fanart_chinese",
         "tmdb_original",
         "tmdb_en_us",
+        "tmdb_en",
         "fanart_english",
         "tmdb_null",
     ]
+    TMDB_IMAGE_LANGUAGES = (
+        "zh-CN",
+        "zh-SG",
+        "zh-TW",
+        "zh-HK",
+        "zh",
+        "en-US",
+        "en",
+        "null",
+    )
+    SELECTION_CACHE_MAX_SIZE = 256
     PRIORITY_OPTIONS = [
         {"title": "TMDB 简体中文（zh-CN）", "value": "tmdb_zh_cn"},
         {"title": "TMDB 新加坡中文（zh-SG）", "value": "tmdb_zh_sg"},
+        {"title": "TMDB 繁体中文（zh-TW）", "value": "tmdb_zh_tw"},
+        {"title": "TMDB 香港中文（zh-HK）", "value": "tmdb_zh_hk"},
+        {"title": "TMDB 泛中文（zh）", "value": "tmdb_zh"},
         {"title": "Fanart Chinese（zh）", "value": "fanart_chinese"},
         {"title": "TMDB 媒体源语言", "value": "tmdb_original"},
         {"title": "TMDB 英语（en-US）", "value": "tmdb_en_us"},
+        {"title": "TMDB 泛英语（en）", "value": "tmdb_en"},
         {"title": "Fanart English（en）", "value": "fanart_english"},
         {"title": "TMDB 无文字（null）", "value": "tmdb_null"},
     ]
@@ -58,9 +78,13 @@ class TmdbPosterLanguagePriority(_PluginBase):
         """初始化插件配置并清空本轮图片选择缓存。"""
         config = config or {}
         self._enabled = bool(config.get("enabled", False))
-        self._priority = self._normalize_priority(config.get("priority"))
+        self._priority = self._normalize_priority(
+            config["priority"] if "priority" in config else None
+        )
         self._tmdb = TmdbApi(language="zh-CN")
-        self._selection_cache: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+        self._selection_cache: OrderedDict[Tuple[str, int, str], Dict[str, Any]] = (
+            OrderedDict()
+        )
         self._cache_lock = threading.RLock()
 
     def get_state(self) -> bool:
@@ -133,7 +157,7 @@ class TmdbPosterLanguagePriority(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "默认顺序：TMDB zh-CN → TMDB zh-SG → Fanart Chinese → TMDB 源语言 → TMDB en-US → Fanart English → TMDB null。TMDB zh-TW/zh-HK 不会进入简体候选。",
+                                            "text": "默认顺序：TMDB zh-CN → TMDB zh-SG → TMDB zh-TW → TMDB zh-HK → TMDB 泛中文 → Fanart Chinese → TMDB 源语言 → TMDB en-US → TMDB 泛英语 → Fanart English → TMDB null。移除候选层会禁用该层。",
                                         },
                                     }
                                 ],
@@ -218,6 +242,8 @@ class TmdbPosterLanguagePriority(_PluginBase):
     @classmethod
     def _normalize_priority(cls, priority: Any) -> List[str]:
         """校验、去重并保留用户配置的候选层顺序。"""
+        if priority is None:
+            return cls.DEFAULT_PRIORITY.copy()
         if isinstance(priority, str):
             raw_items = [item.strip() for item in priority.replace(",", "\n").splitlines()]
         elif isinstance(priority, list):
@@ -230,7 +256,7 @@ class TmdbPosterLanguagePriority(_PluginBase):
         for item in raw_items:
             if item in valid and item not in normalized:
                 normalized.append(item)
-        return normalized or cls.DEFAULT_PRIORITY.copy()
+        return normalized
 
     def _select_images(self, mediainfo: MediaInfo) -> Dict[str, Any]:
         """读取一次 TMDB 候选并按配置按需读取 Fanart 后选择图片。"""
@@ -242,8 +268,22 @@ class TmdbPosterLanguagePriority(_PluginBase):
         )
         with self._cache_lock:
             cached = self._selection_cache.get(cache_key)
+            if cached is not None and hasattr(self._selection_cache, "move_to_end"):
+                self._selection_cache.move_to_end(cache_key)
         if cached:
             return dict(cached)
+
+        if not self._priority:
+            selected = {
+                "poster_url": None,
+                "poster_language": None,
+                "priority_key": None,
+                "priority_label": None,
+                "backdrop_url": None,
+                "logo_url": None,
+            }
+            self._cache_selection(cache_key, selected)
+            return selected
 
         tmdb_images = self._get_tmdb_images(mediainfo, source_language)
         fanart_images: Optional[Dict[str, List[dict]]] = None
@@ -286,26 +326,50 @@ class TmdbPosterLanguagePriority(_PluginBase):
                 tmdb_images.get("logos") or [], source_language
             ),
         }
+        self._cache_selection(cache_key, selected)
+        return selected
+
+    def _cache_selection(
+        self, cache_key: Tuple[str, int, str], selected: Dict[str, Any]
+    ) -> None:
+        """写入图片选择缓存并淘汰最久未使用的条目。"""
         with self._cache_lock:
             self._selection_cache[cache_key] = dict(selected)
-        return selected
+            if hasattr(self._selection_cache, "move_to_end"):
+                self._selection_cache.move_to_end(cache_key)
+                while len(self._selection_cache) > self.SELECTION_CACHE_MAX_SIZE:
+                    self._selection_cache.popitem(last=False)
+                return
+
+            # 兼容旧测试或外部调用手工注入普通 dict 的情况。
+            while len(self._selection_cache) > self.SELECTION_CACHE_MAX_SIZE:
+                oldest_key = next(iter(self._selection_cache))
+                del self._selection_cache[oldest_key]
 
     def _get_tmdb_images(
         self, mediainfo: MediaInfo, source_language: str
     ) -> Dict[str, Any]:
         """通过一次 TMDB images 请求获取所有启用语言层的候选。"""
-        include_languages: List[str] = []
         language_by_priority = {
             "tmdb_zh_cn": "zh-CN",
             "tmdb_zh_sg": "zh-SG",
+            "tmdb_zh_tw": "zh-TW",
+            "tmdb_zh_hk": "zh-HK",
+            "tmdb_zh": "zh",
             "tmdb_original": source_language,
             "tmdb_en_us": "en-US",
+            "tmdb_en": "en",
             "tmdb_null": "null",
         }
+        include_languages: List[str] = []
         for priority_key in self._priority:
             language = language_by_priority.get(priority_key)
-            if language and language not in include_languages:
-                include_languages.append(language)
+            if not language:
+                continue
+            canonical_language = self._canonical_tmdb_image_language(language)
+            if canonical_language and canonical_language not in include_languages:
+                include_languages.append(canonical_language)
+        # null 是无文字海报的必要候选，保留原有请求兼容性并去重。
         if "null" not in include_languages:
             include_languages.append("null")
 
@@ -326,6 +390,15 @@ class TmdbPosterLanguagePriority(_PluginBase):
             return {}
 
     @classmethod
+    def _canonical_tmdb_image_language(cls, language: Any) -> str:
+        """把 TMDB 图片请求语言规范化为 API 需要的大小写格式。"""
+        normalized = cls._normalize_language(language)
+        canonical = {
+            item.lower(): item for item in cls.TMDB_IMAGE_LANGUAGES
+        }
+        return canonical.get(normalized, normalized)
+
+    @classmethod
     def _pick_tmdb_priority(
         cls,
         images: List[dict],
@@ -335,16 +408,26 @@ class TmdbPosterLanguagePriority(_PluginBase):
         """从 TMDB 海报中严格匹配一个配置层并选择评分最佳项。"""
         candidates: List[dict] = []
         for image in images:
-            image_language = cls._normalize_language(image.get("iso_639_1"))
+            image_language = cls._normalize_image_locale(
+                image.get("iso_639_1"), image.get("iso_3166_1")
+            )
             if priority_key == "tmdb_zh_cn" and image_language == "zh-cn":
                 candidates.append(image)
             elif priority_key == "tmdb_zh_sg" and image_language == "zh-sg":
+                candidates.append(image)
+            elif priority_key == "tmdb_zh_tw" and image_language == "zh-tw":
+                candidates.append(image)
+            elif priority_key == "tmdb_zh_hk" and image_language == "zh-hk":
+                candidates.append(image)
+            elif priority_key == "tmdb_zh" and image_language == "zh":
                 candidates.append(image)
             elif priority_key == "tmdb_original" and cls._matches_source_language(
                 image_language, source_language
             ):
                 candidates.append(image)
             elif priority_key == "tmdb_en_us" and image_language == "en-us":
+                candidates.append(image)
+            elif priority_key == "tmdb_en" and image_language == "en":
                 candidates.append(image)
             elif priority_key == "tmdb_null" and image_language == "null":
                 candidates.append(image)
@@ -364,7 +447,9 @@ class TmdbPosterLanguagePriority(_PluginBase):
             return None
         return {
             "url": cls._tmdb_image_url(file_path),
-            "language": cls._normalize_language(selected.get("iso_639_1")),
+            "language": cls._normalize_image_locale(
+                selected.get("iso_639_1"), selected.get("iso_3166_1")
+            ),
         }
 
     @classmethod
@@ -392,10 +477,18 @@ class TmdbPosterLanguagePriority(_PluginBase):
         ranked = sorted(
             images,
             key=lambda item: (
-                2 if cls._normalize_language(item.get("iso_639_1")) == "null" else 0,
+                2
+                if cls._normalize_image_locale(
+                    item.get("iso_639_1"), item.get("iso_3166_1")
+                )
+                == "null"
+                else 0,
                 1
                 if cls._matches_source_language(
-                    cls._normalize_language(item.get("iso_639_1")), source_language
+                    cls._normalize_image_locale(
+                        item.get("iso_639_1"), item.get("iso_3166_1")
+                    ),
+                    source_language,
                 )
                 else 0,
                 float(item.get("vote_average") or 0),
@@ -475,7 +568,7 @@ class TmdbPosterLanguagePriority(_PluginBase):
     def _normalize_fanart_language(cls, language: Any) -> str:
         """统一 Fanart 语言标签并归类中英文。"""
         tag = cls._normalize_language(language)
-        if tag in {"zh", "zh-cn", "zh-sg", "zho", "cmn"}:
+        if tag in {"zh", "zh-cn", "zh-sg", "zh-tw", "zh-hk", "zho", "cmn"}:
             return "zh"
         if tag in {"en", "en-us", "eng"}:
             return "en"
@@ -486,8 +579,33 @@ class TmdbPosterLanguagePriority(_PluginBase):
         """统一语言标签大小写、下划线和空值表示。"""
         if language is None:
             return "null"
-        tag = str(language).strip().lower().replace("_", "-")
+        tag = str(language).strip().lower().replace("_", "-").replace("+", "-")
         return "null" if not tag or tag == "00" else tag
+
+    @classmethod
+    def _normalize_image_locale(
+        cls, image_language: Any, image_region: Any = None
+    ) -> str:
+        """规范化 TMDB 图片语言和地区，优先使用复合语言标签。"""
+        language = cls._normalize_language(image_language)
+        if language == "null":
+            return "null"
+
+        # TMDB 新接口可能直接返回 zh-CN；复合标签优先于独立地区字段。
+        # zh-Hans/zh-Hant 只表示文字脚本，不在此猜测为某个地区。
+        if "-" in language:
+            parts = language.split("-")
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                return f"{parts[0]}-{parts[1]}"
+            return language
+
+        region = cls._normalize_language(image_region)
+        if region != "null":
+            region = region.split("-")[-1]
+            if len(region) == 2 and region.isalpha():
+                return f"{language}-{region}"
+        # 没有地区字段的 zh 必须保留为泛中文，不能猜成某一地区。
+        return language
 
     @staticmethod
     def _tmdb_image_url(image_path: Optional[str]) -> Optional[str]:

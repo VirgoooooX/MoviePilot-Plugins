@@ -29,11 +29,12 @@
     "name": "Emby中文角色同步",
     "description": "同步豆瓣中文演员姓名与角色信息到 Emby。",
     "labels": "媒体服务器,元数据",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "icon": "actor.png",
     "author": "xiaoQQya, VirgoooooX",
     "level": 1,
     "history": {
+      "v1.1.0": "新增只读预演与安全锁定开关，修复 API 假成功、媒体库白名单异常放行及后台线程重入问题。",
       "v1.0.1": "精简插件简介并更新功能图标。",
       "v1.0.0": "首个增强版：支持中文演员与角色同步、媒体库筛选、精准批量同步、预演与冲突保护。"
     }
@@ -42,12 +43,13 @@
     "name": "TMDB/Fanart 海报优先",
     "description": "按来源与语言优先级选择媒体海报。",
     "labels": "元数据,海报",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "icon": "fullscreenposterwall.png",
     "author": "VirgoooooX",
     "level": 1,
     "system_version": ">=2.15.5",
     "history": {
+      "v1.1.0": "支持 TMDB 中文地区图片与旧泛语言标签兼容，补充繁简优先级、有界缓存和独立逻辑测试。",
       "v1.0.1": "精简插件简介并更新功能图标。",
       "v1.0.0": "首个正式版本：支持按 TMDB/Fanart 来源与语言优先级选择主海报。"
     }
@@ -56,12 +58,13 @@
     "name": "Emby TMDB 合集整理",
     "description": "按 TMDB 官方合集整理 Emby 电影。",
     "labels": "媒体服务器,元数据",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "icon": "TheMovieDb_A.png",
     "author": "VirgoooooX",
     "level": 1,
     "system_version": ">=2.15.5",
     "history": {
+      "v1.1.0": "新增计划快照与任务互斥保护、TMDB 中文地区图片兼容，并重做响应式合集卡片界面。",
       "v1.0.1": "精简插件简介并更新功能图标。",
       "v1.0.0": "首个正式版本：支持 TMDB 合集预演、成员审核、合集校正、图片同步与中断恢复。"
     }

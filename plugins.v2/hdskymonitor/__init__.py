@@ -20,9 +20,9 @@ class HdskyMonitor(_PluginBase):
     """天空种子监控插件 - 定时监控天空站点新发布种子，自动下载并通知"""
 
     plugin_name = "天空监控"
-    plugin_desc = "监控天空站点新发布的剧集全集资源，结合 TMDB 识别、媒体库查重和下载器配置完成自动下载与通知。"
-    plugin_icon = "signin.png"
-    plugin_version = "1.0.0"
+    plugin_desc = "监控天空剧集资源并自动下载。"
+    plugin_icon = "rss.png"
+    plugin_version = "1.0.1"
     plugin_label = "站点监控"
     # 插件作者
     plugin_author = "VirgoooooX"

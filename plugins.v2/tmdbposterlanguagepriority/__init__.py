@@ -20,9 +20,9 @@ class TmdbPosterLanguagePriority(_PluginBase):
     """在入库前按可配置优先级选择 TMDB/Fanart 主海报。"""
 
     plugin_name = "TMDB/Fanart 海报优先"
-    plugin_desc = "在媒体元数据写入前，按可配置的 TMDB/Fanart 来源与语言优先级选择主海报。"
+    plugin_desc = "按来源与语言优先级选择媒体海报。"
     plugin_icon = "fullscreenposterwall.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_label = "元数据,海报"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"

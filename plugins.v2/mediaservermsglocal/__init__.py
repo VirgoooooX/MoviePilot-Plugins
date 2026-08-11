@@ -34,11 +34,11 @@ class MediaServerMsgLocal(_PluginBase):
     # 插件基本信息
     plugin_name = "媒体库服务器通知增强版"
     # 插件描述
-    plugin_desc = "聚合并发送 Emby/Jellyfin/Plex 播放与入库通知，优化剧集去重、延迟汇总和插件重载场景。"
+    plugin_desc = "聚合发送媒体服务器播放与入库通知。"
     # 插件图标
-    plugin_icon = "mediaplay.png"
+    plugin_icon = "notifyimage.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_label = "媒体服务器,消息通知"
     # 插件作者
     plugin_author = "jxxghp, VirgoooooX"

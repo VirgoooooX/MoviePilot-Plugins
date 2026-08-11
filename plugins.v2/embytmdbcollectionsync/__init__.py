@@ -20,9 +20,9 @@ class EmbyTmdbCollectionSync(_PluginBase):
     """按照 TMDB 官方合集整理 Emby 电影，并同步合集图片。"""
 
     plugin_name = "Emby TMDB 合集整理"
-    plugin_desc = "基于 TMDB 官方合集预演并校正 Emby 电影合集，支持成员审核、封面徽标同步和中断恢复。"
-    plugin_icon = "mediaplay.png"
-    plugin_version = "1.0.0"
+    plugin_desc = "按 TMDB 官方合集整理 Emby 电影。"
+    plugin_icon = "TheMovieDb_A.png"
+    plugin_version = "1.0.1"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     plugin_label = "媒体服务器,元数据"

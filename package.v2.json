@@ -1,63 +1,68 @@
 {
   "HdskyMonitor": {
     "name": "天空监控",
-    "description": "监控天空站点新发布的剧集全集资源，结合 TMDB 识别、媒体库查重和下载器配置完成自动下载与通知。",
+    "description": "监控天空剧集资源并自动下载。",
     "labels": "站点监控",
-    "version": "1.0.0",
-    "icon": "signin.png",
+    "version": "1.0.1",
+    "icon": "rss.png",
     "author": "VirgoooooX",
     "level": 1,
     "history": {
+      "v1.0.1": "精简插件简介并更新功能图标。",
       "v1.0.0": "首个正式版本：支持天空站点剧集全集监控、TMDB 识别、媒体库查重、自动下载与通知。"
     }
   },
   "MediaServerMsgLocal": {
     "name": "媒体库服务器通知增强版",
-    "description": "聚合并发送 Emby/Jellyfin/Plex 播放与入库通知，优化剧集去重、延迟汇总和插件重载场景。",
+    "description": "聚合发送媒体服务器播放与入库通知。",
     "labels": "媒体服务器,消息通知",
-    "version": "1.0.0",
-    "icon": "mediaplay.png",
+    "version": "1.0.1",
+    "icon": "notifyimage.png",
     "author": "jxxghp, VirgoooooX",
     "level": 1,
     "history": {
+      "v1.0.1": "精简插件简介并更新功能图标。",
       "v1.0.0": "首个增强版：优化剧集入库去重、静默窗口聚合与插件重载场景。"
     }
   },
   "EmbyChineseRoleSync": {
     "name": "Emby中文角色同步",
-    "description": "将豆瓣中文演员姓名与角色信息同步到 Emby，支持媒体库范围、精准检索、批量同步、只读预演和冲突保护。",
+    "description": "同步豆瓣中文演员姓名与角色信息到 Emby。",
     "labels": "媒体服务器,元数据",
-    "version": "1.0.0",
-    "icon": "mediaplay.png",
+    "version": "1.0.1",
+    "icon": "actor.png",
     "author": "xiaoQQya, VirgoooooX",
     "level": 1,
     "history": {
+      "v1.0.1": "精简插件简介并更新功能图标。",
       "v1.0.0": "首个增强版：支持中文演员与角色同步、媒体库筛选、精准批量同步、预演与冲突保护。"
     }
   },
   "TmdbPosterLanguagePriority": {
     "name": "TMDB/Fanart 海报优先",
-    "description": "在媒体元数据写入前，按可配置的 TMDB/Fanart 来源与语言优先级选择主海报。",
+    "description": "按来源与语言优先级选择媒体海报。",
     "labels": "元数据,海报",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "fullscreenposterwall.png",
     "author": "VirgoooooX",
     "level": 1,
     "system_version": ">=2.15.5",
     "history": {
+      "v1.0.1": "精简插件简介并更新功能图标。",
       "v1.0.0": "首个正式版本：支持按 TMDB/Fanart 来源与语言优先级选择主海报。"
     }
   },
   "EmbyTmdbCollectionSync": {
     "name": "Emby TMDB 合集整理",
-    "description": "基于 TMDB 官方合集预演并校正 Emby 电影合集，支持成员审核、封面徽标同步和中断恢复。",
+    "description": "按 TMDB 官方合集整理 Emby 电影。",
     "labels": "媒体服务器,元数据",
-    "version": "1.0.0",
-    "icon": "mediaplay.png",
+    "version": "1.0.1",
+    "icon": "TheMovieDb_A.png",
     "author": "VirgoooooX",
     "level": 1,
     "system_version": ">=2.15.5",
     "history": {
+      "v1.0.1": "精简插件简介并更新功能图标。",
       "v1.0.0": "首个正式版本：支持 TMDB 合集预演、成员审核、合集校正、图片同步与中断恢复。"
     }
   }

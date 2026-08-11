@@ -9,7 +9,7 @@
 
 ### Emby中文角色同步（EmbyChineseRoleSync）
 
-将豆瓣中文演员姓名与角色信息同步到 Emby，支持媒体库范围、精准检索、批量同步、只读预演和冲突保护。
+同步豆瓣中文演员姓名与角色信息到 Emby。
 
 > 原作者：xiaoQQya · 维护者：[VirgoooooX](https://github.com/VirgoooooX) · [源码仓库](https://github.com/VirgoooooX/MoviePilot-Plugins)
 
@@ -43,11 +43,11 @@
 
 #### 当前版本
 
-`v1.0.0`
+`v1.0.1`
 
 ### 天空监控（HdskyMonitor）
 
-监控天空站点新发布的剧集全集资源，结合 TMDB 识别、媒体库查重和下载器配置完成自动下载与通知。
+监控天空剧集资源并自动下载。
 
 > 维护者：[VirgoooooX](https://github.com/VirgoooooX) · [源码仓库](https://github.com/VirgoooooX/MoviePilot-Plugins)
 
@@ -122,11 +122,11 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.0.0`
+`v1.0.1`
 
 ### 媒体库服务器通知增强版（MediaServerMsgLocal）
 
-聚合并发送 Emby/Jellyfin/Plex 播放与入库通知，优化剧集去重、延迟汇总和插件重载场景。
+聚合发送媒体服务器播放与入库通知。
 
 > 原作者：jxxghp · 维护者：[VirgoooooX](https://github.com/VirgoooooX) · [源码仓库](https://github.com/VirgoooooX/MoviePilot-Plugins)
 
@@ -147,11 +147,11 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.0.0`
+`v1.0.1`
 
 ### TMDB/Fanart 海报优先（TmdbPosterLanguagePriority）
 
-在媒体元数据写入前，按可配置的 TMDB/Fanart 来源与语言优先级选择主海报。
+按来源与语言优先级选择媒体海报。
 
 > 维护者：[VirgoooooX](https://github.com/VirgoooooX) · [源码仓库](https://github.com/VirgoooooX/MoviePilot-Plugins)
 
@@ -171,11 +171,11 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.0.0`
+`v1.0.1`
 
 ### Emby TMDB 合集整理（EmbyTmdbCollectionSync）
 
-基于 TMDB 官方合集预演并校正 Emby 电影合集，支持成员审核、封面徽标同步和中断恢复。
+按 TMDB 官方合集整理 Emby 电影。
 
 > 维护者：[VirgoooooX](https://github.com/VirgoooooX) · [源码仓库](https://github.com/VirgoooooX/MoviePilot-Plugins)
 
@@ -201,7 +201,7 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.0.0`
+`v1.0.1`
 
 ## 目录结构
 

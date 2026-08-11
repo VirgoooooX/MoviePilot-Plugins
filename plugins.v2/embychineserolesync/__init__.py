@@ -31,11 +31,11 @@ class EmbyChineseRoleSync(_PluginBase):
     # 插件名称
     plugin_name = "Emby中文角色同步"
     # 插件描述
-    plugin_desc = "将豆瓣中文演员姓名与角色信息同步到 Emby，支持媒体库范围、精准检索、批量同步、只读预演和冲突保护。"
+    plugin_desc = "同步豆瓣中文演员姓名与角色信息到 Emby。"
     # 插件图标
-    plugin_icon = "mediaplay.png"
+    plugin_icon = "actor.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_label = "媒体服务器,元数据"
     # 插件作者
     plugin_author = "xiaoQQya, VirgoooooX"

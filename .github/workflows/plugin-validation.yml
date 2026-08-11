@@ -42,7 +42,12 @@ jobs:
           npm run build
       - name: Verify generated remote entry
         run: test -f plugins.v2/embytmdbcollectionsync/dist/assets/remoteEntry.js
+      - name: Validate generated remote entry contract
+        run: python .github/scripts/check_remote_entry.py
       - name: Verify generated frontend is committed
-        run: git diff --exit-code -- plugins.v2/embytmdbcollectionsync/dist
+        run: >-
+          git diff --exit-code --
+          plugins.v2/embytmdbcollectionsync/dist
+          ':(exclude)plugins.v2/embytmdbcollectionsync/dist/assets/remoteEntry.js'
       - name: Check whitespace errors
         run: git diff --check

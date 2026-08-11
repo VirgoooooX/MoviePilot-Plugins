@@ -252,7 +252,8 @@ def test_selected_media_library_controls_realtime_scope(monkeypatch):
         {
             "enabled": True,
             "mediaservers": ["LivingRoom"],
-            "media_libraries": ["LivingRoom::movies"],
+            "realtime_libraries": ["LivingRoom::movies"],
+            "audit_libraries": ["LivingRoom::movies"],
         }
     )
     assert plugin._selected_library_paths("LivingRoom") == (
@@ -261,6 +262,14 @@ def test_selected_media_library_controls_realtime_scope(monkeypatch):
     )
     assert plugin._selected_library_paths("Other") == (True, [])
     assert plugin._audit_roots() == [(Path("/media/movies"), ["LivingRoom"])]
+    plugin._realtime_libraries = []
+    assert plugin._selected_library_paths("LivingRoom") == (False, [])
+
+
+def test_legacy_library_config_is_kept_as_audit_scope_only():
+    plugin = _plugin({"enabled": True, "media_libraries": ["LivingRoom::foreign"]})
+    assert plugin._realtime_libraries == []
+    assert plugin._audit_libraries == ["LivingRoom::foreign"]
 
 
 def test_form_exposes_library_selection_and_removes_webhook_source(monkeypatch):
@@ -274,7 +283,9 @@ def test_form_exposes_library_selection_and_removes_webhook_source(monkeypatch):
     monkeypatch.setattr(MODULE, "MediaServerHelper", Helper)
     plugin = _plugin()
     form, defaults = plugin.get_form()
-    assert defaults["media_libraries"] == []
+    assert defaults["realtime_libraries"] == []
+    assert defaults["audit_libraries"] == []
+    assert defaults["active_tab"] == "realtime"
 
     def walk(node):
         if isinstance(node, dict):
@@ -286,8 +297,11 @@ def test_form_exposes_library_selection_and_removes_webhook_source(monkeypatch):
                 yield from walk(child)
 
     fields = [node.get("props", {}).get("model") for node in walk(form)]
-    assert "media_libraries" in fields
+    assert "realtime_libraries" in fields
+    assert "audit_libraries" in fields
     assert "webhook_source" not in fields
+    assert any(node.get("component") == "VTabs" for node in walk(form))
+    assert any(node.get("component") == "VWindow" for node in walk(form))
 
 
 def test_scrape_failure_does_not_refresh_emby(tmp_path):

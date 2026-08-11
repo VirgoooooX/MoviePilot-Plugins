@@ -28,7 +28,7 @@ class EmbyMediaImageManager(_PluginBase):
     plugin_name = "Emby媒体图片管理"
     plugin_desc = "Emby入库后实时刮削，并按目标媒体库周期审计简体中文图片。"
     plugin_icon = "image-search-outline"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     plugin_label = "媒体服务器,元数据"
@@ -56,6 +56,8 @@ class EmbyMediaImageManager(_PluginBase):
     _audit_paths = ""
     _exclude_paths = ""
     _mediaservers: List[str] = []
+    _realtime_libraries: List[str] = []
+    _audit_libraries: List[str] = []
 
     def init_plugin(self, config: Optional[dict] = None) -> None:
         """读取并规范化配置，同时清理上一轮延迟任务。"""
@@ -81,13 +83,30 @@ class EmbyMediaImageManager(_PluginBase):
         self._mediaservers = list(
             dict.fromkeys(str(item).strip() for item in values if str(item).strip())
         )
-        libraries = config.get("media_libraries", config.get("libraries", [])) or []
-        library_values = (
-            libraries if isinstance(libraries, list) else str(libraries).splitlines()
+        # 旧版只有一个 media_libraries，迁移到审计范围；实时范围按新约定默认全量。
+        legacy_libraries = (
+            config.get("media_libraries", config.get("libraries", [])) or []
         )
-        self._media_libraries = list(
+        realtime_libraries = config.get("realtime_libraries", []) or []
+        audit_libraries = config.get("audit_libraries", legacy_libraries) or []
+        realtime_values = (
+            realtime_libraries
+            if isinstance(realtime_libraries, list)
+            else str(realtime_libraries).splitlines()
+        )
+        audit_values = (
+            audit_libraries
+            if isinstance(audit_libraries, list)
+            else str(audit_libraries).splitlines()
+        )
+        self._realtime_libraries = list(
             dict.fromkeys(
-                str(item).strip() for item in library_values if str(item).strip()
+                str(item).strip() for item in realtime_values if str(item).strip()
+            )
+        )
+        self._audit_libraries = list(
+            dict.fromkeys(
+                str(item).strip() for item in audit_values if str(item).strip()
             )
         )
         self._lock = threading.RLock()
@@ -153,7 +172,7 @@ class EmbyMediaImageManager(_PluginBase):
         self._library_catalog_at = now
         return catalog
 
-    def _library_options(self) -> List[dict]:
+    def _library_options(self, selected: Optional[List[str]] = None) -> List[dict]:
         """生成配置页的媒体库选择项。"""
         catalog = self._load_library_catalog(force=True)
         options = []
@@ -178,20 +197,28 @@ class EmbyMediaImageManager(_PluginBase):
                 }
             )
         known = {item["value"] for item in options}
-        for key in self._media_libraries:
+        selected_keys = selected or list(
+            dict.fromkeys(self._realtime_libraries + self._audit_libraries)
+        )
+        for key in selected_keys:
             if key not in known:
                 options.append(
                     {"title": f"已保存的媒体库（暂时无法读取）：{key}", "value": key}
                 )
         return options
 
-    def _selected_library_paths(self, server_name: str) -> Tuple[bool, List[str]]:
+    def _selected_library_paths(
+        self, server_name: str, selected: Optional[List[str]] = None
+    ) -> Tuple[bool, List[str]]:
         """返回当前实例是否启用了媒体库筛选及其路径。"""
-        if not self._media_libraries:
+        selected_libraries = (
+            selected if selected is not None else self._realtime_libraries
+        )
+        if not selected_libraries:
             return False, []
         catalog = self._load_library_catalog()
         paths: List[str] = []
-        for key in self._media_libraries:
+        for key in selected_libraries:
             library = catalog.get(key)
             if library and library.get("server") == server_name:
                 paths.extend(library.get("paths") or [])
@@ -200,9 +227,9 @@ class EmbyMediaImageManager(_PluginBase):
     def _audit_roots(self) -> List[Tuple[Path, List[str]]]:
         """返回审计根目录及对应 Emby 实例，媒体库选择优先于旧路径配置。"""
         roots: Dict[str, Dict[str, Any]] = {}
-        if self._media_libraries:
+        if self._audit_libraries:
             catalog = self._load_library_catalog()
-            for key in self._media_libraries:
+            for key in self._audit_libraries:
                 library = catalog.get(key)
                 if not library:
                     continue
@@ -259,7 +286,7 @@ class EmbyMediaImageManager(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """返回分区清晰的实时刮削与图片审计配置表单。"""
+        """返回实时刮削与周期审计分离的 Tab 配置表单。"""
         try:
             server_items = [
                 {"title": config.name, "value": config.name}
@@ -270,6 +297,7 @@ class EmbyMediaImageManager(_PluginBase):
             logger.warning("读取 Emby 服务配置失败：%s", err)
             server_items = []
 
+        library_items = self._library_options()
         defaults = {
             "enabled": False,
             "realtime_enabled": True,
@@ -280,11 +308,107 @@ class EmbyMediaImageManager(_PluginBase):
             "aggregate_seconds": 90,
             "audit_cron": self.DEFAULT_AUDIT_CRON,
             "mediaservers": [],
-            "media_libraries": [],
+            "realtime_libraries": [],
+            "audit_libraries": [],
             "realtime_paths": "",
             "audit_paths": "",
             "exclude_paths": "",
+            "active_tab": "realtime",
         }
+        realtime_content = [
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "success",
+                    "variant": "tonal",
+                    "title": "实时处理全部新入库媒体",
+                    "text": "默认覆盖所选 Emby 实例的全部媒体库；如果只想限制范围，再选择具体媒体库。",
+                    "class": "mb-4",
+                },
+            },
+            self._form_col(
+                "realtime_enabled",
+                "启用新入库实时刮削",
+                "收到 MoviePilot 的 Emby 入库事件后延迟处理。",
+                12,
+            ),
+            self._library_select(
+                "realtime_libraries",
+                "实时处理媒体库（可选）",
+                "留空表示处理所选 Emby 实例的全部媒体库。",
+                library_items,
+            ),
+            {
+                "component": "VRow",
+                "content": [
+                    self._number_col(
+                        "delay_seconds",
+                        "电影等待时间（秒）",
+                        "等待 Emby 完成文件扫描后再刮削。",
+                    ),
+                    self._number_col(
+                        "aggregate_seconds",
+                        "剧集静默窗口（秒）",
+                        "最后一集事件后等待多久，再处理整部剧。",
+                    ),
+                ],
+            },
+            self._path_field(
+                "realtime_paths",
+                "实时目录兜底（可选）",
+                "只有没有选择实时媒体库时才使用；每行一个宿主可访问路径。",
+            ),
+        ]
+        audit_content = [
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "warning",
+                    "variant": "tonal",
+                    "title": "只审计明确选择的外语媒体库",
+                    "text": "建议只选择外语电影库、外语剧库；不选择媒体库时不会扫描，除非填写审计目录兜底。",
+                    "class": "mb-4",
+                },
+            },
+            self._form_col(
+                "audit_enabled",
+                "启用周期图片审计",
+                "按计划检查所选审计媒体库中的简体中文图片候选。",
+                12,
+            ),
+            self._library_select(
+                "audit_libraries",
+                "周期审计媒体库（建议必选）",
+                "只选择需要补中文图片的外语库；留空且未填写目录兜底时不会扫描。",
+                library_items,
+            ),
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 5},
+                        "content": [
+                            {
+                                "component": "VCronField",
+                                "props": {
+                                    "model": "audit_cron",
+                                    "label": "审计计划",
+                                    "hint": "默认每月 1 日凌晨 4 点：0 4 1 * *",
+                                    "persistent-hint": True,
+                                },
+                            }
+                        ],
+                    },
+                    self._path_field(
+                        "audit_paths",
+                        "审计目录兜底（可选）",
+                        "只有没有选择审计媒体库时才使用；每行一个宿主可访问路径。",
+                        md=7,
+                    ),
+                ],
+            },
+        ]
         return [
             {
                 "component": "VForm",
@@ -294,8 +418,8 @@ class EmbyMediaImageManager(_PluginBase):
                         "props": {
                             "type": "info",
                             "variant": "tonal",
-                            "title": "两条图片管理链路",
-                            "text": "实时刮削负责新入库媒体；周期审计只检查指定存量目录。两者可独立启用。",
+                            "title": "实时与审计各管各的",
+                            "text": "实时刮削面向全部新入库媒体；周期审计面向少量需要补中文图片的外语库。两套媒体库选择互不影响。",
                             "class": "mb-4",
                         },
                     },
@@ -308,52 +432,9 @@ class EmbyMediaImageManager(_PluginBase):
                                 "总开关；关闭后不会接收事件或运行审计。",
                                 12,
                             ),
-                            self._form_col(
-                                "realtime_enabled",
-                                "新入库实时刮削",
-                                "收到 Emby library.new 后延迟处理。",
-                                6,
-                            ),
-                            self._form_col(
-                                "audit_enabled",
-                                "存量图片周期审计",
-                                "按计划检查指定目录中的简体中文图片候选。",
-                                6,
-                            ),
-                            self._form_col(
-                                "movie_enabled",
-                                "处理电影",
-                                "实时与审计流程均遵循此开关。",
-                                6,
-                            ),
-                            self._form_col(
-                                "tv_enabled",
-                                "处理电视剧",
-                                "同一剧集的连续事件会合并为一次。",
-                                6,
-                            ),
-                        ],
-                    },
-                    {
-                        "component": "VDivider",
-                        "props": {"class": "my-5"},
-                    },
-                    {
-                        "component": "div",
-                        "props": {"class": "text-subtitle-1 font-weight-bold mb-1"},
-                        "text": "实时刮削",
-                    },
-                    {
-                        "component": "div",
-                        "props": {"class": "text-body-2 text-medium-emphasis mb-3"},
-                        "text": "先选择 Emby 实例和媒体库，再设置等待窗口；剧集事件会聚合到整部剧目录。",
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12},
                                 "content": [
                                     {
                                         "component": "VSelect",
@@ -367,133 +448,156 @@ class EmbyMediaImageManager(_PluginBase):
                                             "chips": True,
                                             "closable-chips": True,
                                             "variant": "outlined",
-                                            "hint": "留空接收全部 Emby 实例；选择后同时限制事件来源与刷新目标。",
+                                            "hint": "留空接收全部 Emby 实例；选择后同时限制实时事件和审计刷新目标。",
                                             "persistent-hint": True,
                                         },
                                     }
                                 ],
                             },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "media_libraries",
-                                            "label": "处理哪些媒体库",
-                                            "items": self._library_options(),
-                                            "item-title": "title",
-                                            "item-value": "value",
-                                            "multiple": True,
-                                            "chips": True,
-                                            "closable-chips": True,
-                                            "variant": "outlined",
-                                            "hint": "选择后自动使用 Emby 媒体库路径；留空表示处理所选 Emby 实例的全部媒体库。",
-                                            "persistent-hint": True,
-                                            "no-data-text": "未读取到可用 Emby 媒体库，请先检查实例连接。",
-                                        },
-                                    }
-                                ],
-                            },
-                            self._number_col(
-                                "delay_seconds",
-                                "电影等待时间（秒）",
-                                "等待 Emby 完成文件扫描后再刮削。",
+                            self._form_col(
+                                "movie_enabled",
+                                "处理电影",
+                                "同时应用于实时刮削和周期审计。",
+                                6,
                             ),
-                            self._number_col(
-                                "aggregate_seconds",
-                                "剧集静默窗口（秒）",
-                                "最后一集事件后等待多久，再处理整部剧。",
+                            self._form_col(
+                                "tv_enabled",
+                                "处理电视剧",
+                                "同一剧集的连续入库事件会合并为一次。",
+                                6,
                             ),
                         ],
                     },
                     {
-                        "component": "VTextarea",
+                        "component": "VTabs",
                         "props": {
-                            "model": "realtime_paths",
-                            "label": "实时目录兜底（可选）",
-                            "rows": 3,
-                            "auto-grow": True,
-                            "variant": "outlined",
-                            "hint": "选择媒体库后可留空；仅在没有选择媒体库时作为路径白名单。",
-                            "persistent-hint": True,
+                            "model": "active_tab",
+                            "color": "primary",
+                            "grow": True,
+                            "class": "mt-3",
                         },
-                    },
-                    {"component": "VDivider", "props": {"class": "my-5"}},
-                    {
-                        "component": "div",
-                        "props": {"class": "text-subtitle-1 font-weight-bold mb-1"},
-                        "text": "周期审计",
-                    },
-                    {
-                        "component": "div",
-                        "props": {"class": "text-body-2 text-medium-emphasis mb-3"},
-                        "text": "优先扫描所选媒体库；没有选择媒体库时才使用下面的目录兜底。已成功补齐简体图片的媒体会被记住并跳过。",
-                    },
-                    {
-                        "component": "VAlert",
-                        "props": {
-                            "type": "warning",
-                            "variant": "tonal",
-                            "density": "compact",
-                            "text": "审计候选语言由“TMDB/Fanart 海报优先”插件提供；未启用时只会记录等待，不会覆盖现有图片。",
-                            "class": "mb-3",
-                        },
-                    },
-                    {
-                        "component": "VRow",
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 5},
-                                "content": [
-                                    {
-                                        "component": "VCronField",
-                                        "props": {
-                                            "model": "audit_cron",
-                                            "label": "审计计划",
-                                            "hint": "默认每月 1 日凌晨 4 点：0 4 1 * *",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VTab",
+                                "props": {
+                                    "value": "realtime",
+                                    "prepend-icon": "mdi-flash-outline",
+                                },
+                                "text": "实时刮削",
                             },
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 7},
-                                "content": [
-                                    {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "audit_paths",
-                                            "label": "审计目录兜底（可选）",
-                                            "rows": 3,
-                                            "auto-grow": True,
-                                            "variant": "outlined",
-                                            "hint": "选择媒体库后可留空；没有媒体库选择时，每行填写一个宿主可访问路径。",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
+                                "component": "VTab",
+                                "props": {
+                                    "value": "audit",
+                                    "prepend-icon": "mdi-calendar-search-outline",
+                                },
+                                "text": "周期审计",
                             },
                         ],
                     },
                     {
-                        "component": "VTextarea",
-                        "props": {
-                            "model": "exclude_paths",
-                            "label": "排除目录（可选）",
-                            "rows": 2,
-                            "auto-grow": True,
-                            "variant": "outlined",
-                            "hint": "媒体库选择之外的高级排除项；每行一个路径，同时应用于实时刮削和周期审计。",
-                            "persistent-hint": True,
-                        },
+                        "component": "VWindow",
+                        "props": {"model": "active_tab", "class": "mt-4"},
+                        "content": [
+                            {
+                                "component": "VWindowItem",
+                                "props": {"value": "realtime"},
+                                "content": realtime_content,
+                            },
+                            {
+                                "component": "VWindowItem",
+                                "props": {"value": "audit"},
+                                "content": audit_content,
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VExpansionPanels",
+                        "props": {"variant": "accordion", "class": "mt-4"},
+                        "content": [
+                            {
+                                "component": "VExpansionPanel",
+                                "content": [
+                                    {
+                                        "component": "VExpansionPanelTitle",
+                                        "text": "高级：公共排除目录",
+                                    },
+                                    {
+                                        "component": "VExpansionPanelText",
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {
+                                                    "class": "text-body-2 text-medium-emphasis mb-3"
+                                                },
+                                                "text": "媒体库选择之外的统一排除项，同时应用于实时刮削和周期审计；通常可以留空。",
+                                            },
+                                            self._path_field(
+                                                "exclude_paths",
+                                                "排除目录（可选）",
+                                                "每行一个宿主可访问路径。",
+                                            ),
+                                        ],
+                                    },
+                                ],
+                            }
+                        ],
                     },
                 ],
             }
         ], defaults
+
+    @staticmethod
+    def _library_select(model: str, label: str, hint: str, items: List[dict]) -> dict:
+        """生成媒体库多选控件。"""
+        return {
+            "component": "VCol",
+            "props": {"cols": 12},
+            "content": [
+                {
+                    "component": "VSelect",
+                    "props": {
+                        "model": model,
+                        "label": label,
+                        "items": items,
+                        "item-title": "title",
+                        "item-value": "value",
+                        "multiple": True,
+                        "chips": True,
+                        "closable-chips": True,
+                        "variant": "outlined",
+                        "hint": hint,
+                        "persistent-hint": True,
+                        "no-data-text": "未读取到可用 Emby 媒体库，请先检查实例连接。",
+                    },
+                }
+            ],
+        }
+
+    @staticmethod
+    def _path_field(
+        model: str, label: str, hint: str, md: Optional[int] = None
+    ) -> dict:
+        """生成路径兜底文本域，可嵌入响应式列。"""
+        field = {
+            "component": "VTextarea",
+            "props": {
+                "model": model,
+                "label": label,
+                "rows": 3,
+                "auto-grow": True,
+                "variant": "outlined",
+                "hint": hint,
+                "persistent-hint": True,
+            },
+        }
+        if md:
+            return {
+                "component": "VCol",
+                "props": {"cols": 12, "md": md},
+                "content": [field],
+            }
+        return field
 
     @staticmethod
     def _form_col(model: str, label: str, hint: str, md: int) -> dict:
@@ -552,10 +656,15 @@ class EmbyMediaImageManager(_PluginBase):
         pending_audit = sum(
             1 for item in states.values() if item.get("status") == "pending"
         )
-        scope_text = (
-            f"媒体库 {len(self._media_libraries)} 个"
-            if self._media_libraries
-            else "按所选实例全部媒体库"
+        realtime_scope = (
+            f"实时库 {len(self._realtime_libraries)} 个"
+            if self._realtime_libraries
+            else "实时库：全部"
+        )
+        audit_scope = (
+            f"审计库 {len(self._audit_libraries)} 个"
+            if self._audit_libraries
+            else "审计库：未选择"
         )
         enabled_text = "运行中" if self._enabled else "已停用"
         status_color = "success" if self._enabled else "grey"
@@ -596,7 +705,12 @@ class EmbyMediaImageManager(_PluginBase):
                                     {
                                         "component": "VChip",
                                         "props": {"variant": "tonal"},
-                                        "text": scope_text,
+                                        "text": realtime_scope,
+                                    },
+                                    {
+                                        "component": "VChip",
+                                        "props": {"variant": "tonal"},
+                                        "text": audit_scope,
                                     },
                                     {"component": "VSpacer"},
                                     {

@@ -8,7 +8,7 @@ const props = defineProps({
   saving: Boolean,
   hideTitle: Boolean,
 })
-const emit = defineEmits(['refresh', 'save', 'scan', 'apply', 'cancel'])
+const emit = defineEmits(['refresh', 'save', 'scan', 'apply', 'subscribe', 'restore', 'cancel'])
 
 const tab = ref('plan')
 const confirmDialog = ref(false)
@@ -43,7 +43,20 @@ watch(rows, value => {
 }, { deep: true })
 
 function rowHasChanges(row) {
-  return Boolean(row.create || row.add?.length || row.remove?.length || row.poster || row.logo)
+  return !row.customized && Boolean(row.create || row.add?.length || row.remove?.length || row.poster || row.logo)
+}
+
+function subscribeMissing(row) {
+  if (busy.value || !row.missing_movies?.length) return
+  emit('subscribe', {
+    plan_id: plan.value?.plan_id || '',
+    tmdb_ids: row.missing_movies.map(item => String(item.tmdb_id)),
+  })
+}
+
+function restoreManagement(row) {
+  if (busy.value || !row.customized) return
+  emit('restore', { collection_id: String(row.key) })
 }
 
 // 选择所有存在实际变更的合集。
@@ -120,7 +133,7 @@ function confirmApply() {
           <VCol cols="12" sm="6" md="3"><VSwitch v-model="config.sync_logo" label="同步合集徽标" color="primary" /></VCol>
         </VRow>
         <VAlert class="mt-1" type="info" variant="tonal" density="comfortable">
-          合集封面和徽标只使用 TMDB 图片；地区标签兼容 zh-CN、zh-SG、zh-TW、zh-HK 及泛 zh，不再调用不支持合集 ID 的 Fanart movie 接口。
+          插件会识别 TMDB 合集缺片并支持一键订阅。已接管合集若被用户手工改名或调整成员，会自动转为“人工合集保护”，其中电影不再被分配到其它合集。
         </VAlert>
         <div class="d-flex flex-wrap ga-3 mt-3">
           <VBtn prepend-icon="mdi-content-save" color="primary" variant="tonal" :loading="saving" @click="emit('save')">保存设置</VBtn>
@@ -139,8 +152,9 @@ function confirmApply() {
         <VRow class="mb-2">
           <VCol v-for="item in [
             ['电影', summary.movies || 0], ['合集', summary.collections || 0], ['新建', summary.create || 0],
-            ['待接管', summary.adopt || 0], ['加入', summary.add || 0], ['移除', summary.remove || 0]
-          ]" :key="item[0]" cols="6" sm="4" md="2">
+            ['待接管', summary.adopt || 0], ['加入', summary.add || 0], ['移除', summary.remove || 0],
+            ['缺片', summary.missing || 0], ['人工保护', summary.customized || 0]
+          ]" :key="item[0]" cols="6" sm="4" md="3" lg="1">
             <VCard variant="tonal"><VCardText><div class="text-caption">{{ item[0] }}</div><div class="text-h5">{{ item[1] }}</div></VCardText></VCard>
           </VCol>
         </VRow>
@@ -161,9 +175,10 @@ function confirmApply() {
                 <VImg v-if="row.poster" :src="row.poster" :alt="`${row.name} 海报`" cover height="248" />
                 <div v-else class="collection-card__placeholder" role="img" :aria-label="`${row.name} 无海报`"><VIcon icon="mdi-movie-filter-outline" size="48" /><span>暂无 TMDB 海报</span></div>
                 <div class="collection-card__overlay">
-                  <VCheckboxBtn v-model="selected" :value="String(row.key)" color="primary" :aria-label="`选择 ${row.name}`" @click.stop />
+                  <VCheckboxBtn v-model="selected" :value="String(row.key)" color="primary" :disabled="row.customized" :aria-label="`选择 ${row.name}`" @click.stop />
                   <VChip v-if="row.create" size="small" color="primary" variant="flat">新建</VChip>
                   <VChip v-else-if="row.requires_adoption" size="small" color="warning" variant="flat">待接管</VChip>
+                  <VChip v-else-if="row.customized" size="small" color="purple" variant="flat">人工保护</VChip>
                 </div>
               </div>
               <VCardText class="collection-card__body">
@@ -173,6 +188,7 @@ function confirmApply() {
                   <VChip v-if="row.add?.length" size="small" color="success" variant="tonal">加入 {{ row.add.length }}</VChip>
                   <VChip v-if="row.remove?.length" size="small" color="error" variant="tonal">移除 {{ row.remove.length }}</VChip>
                   <VChip v-if="row.poster || row.logo" size="small" color="info" variant="tonal">图片</VChip>
+                  <VChip v-if="row.missing_movies?.length" size="small" color="warning" variant="tonal">缺片 {{ row.missing_movies.length }}</VChip>
                   <VChip v-if="!rowHasChanges(row)" size="small" variant="tonal">无成员变更</VChip>
                 </div>
                 <div v-if="row.add?.length || row.remove?.length" class="collection-card__preview text-caption mt-3">
@@ -183,10 +199,15 @@ function confirmApply() {
                 <VAlert v-if="row.requires_adoption" class="mt-3" type="warning" variant="tonal" density="compact">
                   同名合集“{{ row.candidate_name }}”
                 </VAlert>
+                <VAlert v-if="row.customized" class="mt-3" type="info" variant="tonal" density="compact">
+                  {{ row.customized_reason }}。当前成员优先，后续扫描不会移动或重复分配这些电影。
+                </VAlert>
               </VCardText>
               <VCardActions class="pt-0">
                 <VBtn size="small" variant="text" prepend-icon="mdi-eye-outline" @click="openDetails(row)">查看详情</VBtn>
                 <VSpacer />
+                <VBtn v-if="row.missing_movies?.length" size="small" color="primary" variant="tonal" prepend-icon="mdi-bell-plus-outline" :disabled="busy" @click="subscribeMissing(row)">订阅缺片</VBtn>
+                <VBtn v-if="row.customized" size="small" color="warning" variant="text" :disabled="busy" @click="restoreManagement(row)">恢复 TMDB 管理</VBtn>
                 <VCheckbox v-if="row.requires_adoption" v-model="adopted" :value="String(row.key)" label="确认接管" color="warning" hide-details density="compact" @click.stop />
               </VCardActions>
             </VCard>
@@ -209,10 +230,15 @@ function confirmApply() {
             <VCol cols="12" md="3"><VImg v-if="detailsRow.poster" :src="detailsRow.poster" :alt="`${detailsRow.name} 海报`" aspect-ratio="0.667" cover class="rounded" /><div v-else class="details-placeholder">暂无海报</div><div class="text-caption mt-2">封面 {{ detailsRow.poster_language || '无' }}</div></VCol>
             <VCol cols="12" md="9">
               <VAlert v-if="detailsRow.requires_adoption" type="warning" variant="tonal" class="mb-4">只有确认接管后，插件才会校正同名合集的成员与图片。</VAlert>
+              <VAlert v-if="detailsRow.customized" type="info" variant="tonal" class="mb-4">该合集已检测到人工修改并锁定。只有点击“恢复 TMDB 管理”后，插件才会重新生成成员校正计划。</VAlert>
               <VRow>
                 <VCol cols="12" sm="6"><div class="text-subtitle-2 mb-2">加入成员（{{ detailsRow.add?.length || 0 }}）</div><VList v-if="detailsRow.add?.length" density="compact" lines="one"><VListItem v-for="item in detailsRow.add" :key="item.id" :title="item.name" :subtitle="`Emby ${item.id}`" /></VList><span v-else class="text-medium-emphasis">无</span></VCol>
                 <VCol cols="12" sm="6"><div class="text-subtitle-2 mb-2">移除错误成员（{{ detailsRow.remove?.length || 0 }}）</div><VList v-if="detailsRow.remove?.length" density="compact" lines="one"><VListItem v-for="item in detailsRow.remove" :key="item.Id || item.id" :title="item.Name || item.name" :subtitle="`Emby ${item.Id || item.id}`" /></VList><span v-else class="text-medium-emphasis">无</span></VCol>
               </VRow>
+              <div v-if="detailsRow.missing_movies?.length" class="mt-4">
+                <div class="d-flex align-center mb-2"><div class="text-subtitle-2">TMDB 合集缺片（{{ detailsRow.missing_movies.length }}）</div><VSpacer /><VBtn size="small" color="primary" prepend-icon="mdi-bell-plus-outline" :disabled="busy" @click="subscribeMissing(detailsRow)">一键订阅全部缺片</VBtn></div>
+                <VList density="compact" lines="two"><VListItem v-for="item in detailsRow.missing_movies" :key="item.tmdb_id" :title="item.title" :subtitle="`${item.year || '年份未知'} · TMDB ${item.tmdb_id}`"><template #prepend><VAvatar rounded="0" size="44"><VImg v-if="item.poster" :src="item.poster" cover /><VIcon v-else icon="mdi-movie-outline" /></VAvatar></template></VListItem></VList>
+              </div>
               <div v-if="detailsRow.logo" class="mt-4"><div class="text-subtitle-2 mb-2">徽标 {{ detailsRow.logo_language || '无' }}</div><VImg :src="detailsRow.logo" :alt="`${detailsRow.name} 徽标`" max-height="110" contain class="details-logo" /></div>
             </VCol>
           </VRow>

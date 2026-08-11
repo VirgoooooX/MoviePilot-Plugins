@@ -316,6 +316,48 @@ def test_member_snapshot_is_order_independent_and_detects_changes():
     assert hash_one != hash_three
 
 
+def test_managed_collection_member_or_name_change_is_detected_as_customization():
+    _, baseline_hash = EmbyTmdbCollectionSync._member_snapshot([{"Id": "movie-1"}])
+    _, changed_hash = EmbyTmdbCollectionSync._member_snapshot([{"Id": "movie-1"}, {"Id": "movie-2"}])
+    state = {"member_hash": baseline_hash, "emby_name": "哥斯拉合集"}
+    assert "成员" in EmbyTmdbCollectionSync._customization_reason(state, changed_hash, "哥斯拉合集")
+    assert "名称" in EmbyTmdbCollectionSync._customization_reason(state, baseline_hash, "哥斯拉全系列")
+    assert EmbyTmdbCollectionSync._customization_reason(state, baseline_hash, "哥斯拉合集") == ""
+
+
+def test_legacy_cross_tmdb_members_are_evidence_of_manual_merge():
+    official = {"godzilla-1": "10", "godzilla-2": "20", "unmatched": ""}
+    assert EmbyTmdbCollectionSync._cross_collection_members(
+        ["godzilla-1", "godzilla-2", "unmatched"], official, "10"
+    ) == ["godzilla-2"]
+
+
+def test_collection_movies_are_compact_deduplicated_and_sorted():
+    movies = EmbyTmdbCollectionSync._normalize_collection_movies([
+        {"id": 2, "title": "续集", "release_date": "2024-05-01", "poster_path": "/two.jpg"},
+        {"id": 1, "title": "首部", "release_date": "2020-01-01"},
+        {"id": 1, "title": "重复记录", "release_date": "2020-01-01"},
+    ])
+    assert [item["tmdb_id"] for item in movies] == ["1", "2"]
+    assert movies[1]["year"] == "2024"
+    assert movies[1]["poster"].endswith("/two.jpg")
+
+
+def test_subscribe_endpoint_only_accepts_missing_movies_from_current_plan():
+    plugin = _plugin()
+    plugin._store[plugin.DATA_PLAN] = {
+        "plan_id": "plan-1",
+        "collections": [{"key": "10", "missing_movies": [{"tmdb_id": "100", "title": "缺片"}]}],
+    }
+    started = []
+    plugin._start_worker = lambda *args: (started.append(args) or True, "started")
+    response = plugin.api_start_subscribe({"plan_id": "plan-1", "tmdb_ids": ["100"]})
+    assert response.success is True
+    assert started and started[0][1] == "subscribe"
+    rejected = plugin.api_start_subscribe({"plan_id": "plan-1", "tmdb_ids": ["999"]})
+    assert rejected.success is False
+
+
 def test_stale_plan_row_is_rejected_before_apply():
     plugin = _plugin()
     plugin._load_boxsets = lambda service: [{"Id": "box-1", "Name": "测试合集"}]

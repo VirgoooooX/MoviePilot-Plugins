@@ -51,6 +51,21 @@ async function apply(payload) {
   try { unwrapResponse(await props.api.post(`${base.value}/apply`, payload)); await loadStatus(); return true } catch (err) { error.value = err?.message || '执行启动失败'; return false }
 }
 
+// 把预演中的 TMDB 合集缺片交给 MoviePilot 原生电影订阅链。
+async function subscribe(payload) {
+  try { unwrapResponse(await props.api.post(`${base.value}/subscribe`, payload)); await loadStatus(); return true } catch (err) { error.value = err?.message || '缺片订阅启动失败'; return false }
+}
+
+// 解除人工保护后立即重新预演；真正写入 Emby 仍需用户审核执行。
+async function restore(payload) {
+  try {
+    unwrapResponse(await props.api.post(`${base.value}/customization`, payload))
+    unwrapResponse(await props.api.post(`${base.value}/scan`, {}))
+    await loadStatus()
+    return true
+  } catch (err) { error.value = err?.message || '恢复 TMDB 管理失败'; return false }
+}
+
 // 请求取消扫描或执行任务。
 async function cancel() {
   try { unwrapResponse(await props.api.post(`${base.value}/cancel`, {})); await loadStatus(); return true } catch (err) { error.value = err?.message || '取消任务失败'; return false }
@@ -63,5 +78,5 @@ onBeforeUnmount(() => timer && window.clearInterval(timer))
 
 <template>
   <VAlert v-if="error" type="error" variant="tonal" class="ma-4" :text="error" />
-  <CollectionManager :status="status" :config="config" :loading="loading" :saving="saving" :hide-title="hideTitle" @refresh="loadStatus" @save="saveConfig" @scan="scan" @apply="apply" @cancel="cancel" />
+  <CollectionManager :status="status" :config="config" :loading="loading" :saving="saving" :hide-title="hideTitle" @refresh="loadStatus" @save="saveConfig" @scan="scan" @apply="apply" @subscribe="subscribe" @restore="restore" @cancel="cancel" />
 </template>

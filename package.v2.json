@@ -76,5 +76,22 @@
       "v1.1.0": "新增 Vuetify JSON 配置界面，支持调整候选层顺序或禁用候选层；TMDB 图片改为一次请求并按完整语言标签严格匹配。",
       "v1.0.0": "新增入库前海报选择：TMDB zh-CN、TMDB zh-SG、Fanart Chinese、TMDB 源语言、TMDB en-US、Fanart English、TMDB null。"
     }
+  },
+  "EmbyTmdbCollectionSync": {
+    "name": "Emby TMDB 合集整理",
+    "description": "按 TMDB 官方合集预演、审核并校正 Emby 电影合集，支持封面和徽标。",
+    "labels": "媒体服务器,元数据",
+    "version": "1.0.4",
+    "icon": "mediaplay.png",
+    "author": "local",
+    "level": 1,
+    "system_version": ">=2.15.5",
+    "history": {
+      "v1.0.4": "修复 LoggerManager 不支持 exception；执行前统一校验待接管合集，逐合集保存管理状态，并自动复用中断前已创建的同名合集。",
+      "v1.0.3": "TMDB 临时后端错误改为绕过错误缓存并退避重试；单部电影最终失败仅进入异常清单，不再终止整个预演。",
+      "v1.0.2": "修复线程包装器覆盖真实失败状态；保留完整异常回溯，并从第 1 部电影开始保存 TMDB 缓存。",
+      "v1.0.1": "修复预演任务线程退出后状态仍停留 0%；增加阶段进度、任务心跳、中断恢复和分批 TMDB 缓存。",
+      "v1.0.0": "按 TMDB 官方合集生成预演计划，支持接管审核、成员校正及中文优先的封面和徽标同步。"
+    }
   }
 }

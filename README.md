@@ -225,6 +225,7 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 - **入库事件聚合**：接收 Emby `library.new` Webhook，电影按延迟处理，连续剧集事件按整部剧静默聚合，避免重复刮削。
 - **媒体库范围分离**：实时刮削默认覆盖所选实例的全部媒体库；存量图片检查单独选择少量外语电影库、剧库，两个范围互不影响。
 - **简体图片检查**：按检查计划扫描所选媒体库，发现简体中文候选后覆盖刮削并刷新 Emby。
+- **立即检查**：存量图片检查页支持点击“立即检查一次”，按当前配置后台执行，并与定时检查互斥。
 - **合集图片刷新**：新增“合集图片”Tab，只读取现有 Emby BoxSet，按 TMDB/Fanart 海报优先级分别更新 poster 和 Logo，不创建、删除或改动合集成员；上传后回读 ImageTags 验证。
 - **安全运行状态**：存量检查和合集图片任务互斥执行、分批保存进度；详情页展示待处理事件、已补齐媒体、合集成功/跳过/失败和最近结果。
 
@@ -244,7 +245,7 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.3.0`
+`v1.3.1`
 
 ## 目录结构
 

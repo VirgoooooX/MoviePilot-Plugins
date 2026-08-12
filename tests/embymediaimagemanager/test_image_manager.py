@@ -82,6 +82,12 @@ def _load_plugin_module():
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
 
+    class Response:
+        def __init__(self, success=True, message="", data=None):
+            self.success = success
+            self.message = message
+            self.data = data
+
     class MediaServerHelper:
         def get_configs(self):
             return {}
@@ -106,6 +112,7 @@ def _load_plugin_module():
     schema_types.MediaType = MediaType
     schemas.FileItem = FileItem
     schemas.RefreshMediaItem = RefreshMediaItem
+    schemas.Response = Response
     schemas.ServiceInfo = object
     schemas.WebhookEventInfo = object
     chain_media.MediaChain = object
@@ -426,6 +433,34 @@ def test_form_exposes_collection_artwork_tab_and_api(monkeypatch):
     assert "/collection-artwork/scan" in paths
     assert "/collection-artwork/status" in paths
     assert "/collection-artwork/cancel" in paths
+    assert "/image-check/scan" in paths
+
+
+def test_manual_image_check_starts_background_worker(monkeypatch):
+    plugin = _plugin({"enabled": True, "audit_enabled": False})
+    started = []
+
+    class FakeThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+            self.alive = False
+            started.append(self)
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+    monkeypatch.setattr(MODULE.threading, "Thread", FakeThread)
+    response = plugin.api_start_image_check()
+    assert response.success is True
+    assert started
+
+    started[0].alive = True
+    response = plugin.api_start_image_check()
+    assert response.success is False
+    assert "正在运行" in response.message
 
 
 def test_scrape_failure_does_not_refresh_emby(tmp_path):

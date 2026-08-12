@@ -63,7 +63,7 @@ class EmbyMediaImageManager(_PluginBase):
     plugin_name = "Emby媒体图片管理"
     plugin_desc = "Emby入库后实时刮削、检查存量图片，并刷新现有合集封面与徽标。"
     plugin_icon = "image-search-outline"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     plugin_label = "媒体服务器,元数据"
@@ -192,6 +192,12 @@ class EmbyMediaImageManager(_PluginBase):
         self._last_audit_at = ""
         self._last_audit_result = "尚未执行存量图片检查"
         self._audit_running = False
+        previous_audit_worker = getattr(self, "_audit_worker", None)
+        if previous_audit_worker and previous_audit_worker.is_alive():
+            # 热重载时保留仍在退出中的线程引用，避免立即启动第二次存量检查。
+            self._audit_worker = previous_audit_worker
+        else:
+            self._audit_worker = None
         self._collection_lock = getattr(self, "_collection_lock", threading.RLock())
         previous_worker = getattr(self, "_collection_worker", None)
         previous_stop_event = getattr(self, "_collection_stop_event", None)
@@ -606,6 +612,14 @@ class EmbyMediaImageManager(_PluginBase):
         """返回插件 API 列表。"""
         return [
             {
+                "path": "/image-check/scan",
+                "endpoint": self.api_start_image_check,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即检查存量图片",
+                "description": "立即后台执行一次存量图片检查，与定时检查共用互斥锁。",
+            },
+            {
                 "path": "/collection-artwork/scan",
                 "endpoint": self.api_start_collection_artwork_scan,
                 "methods": ["POST"],
@@ -844,12 +858,44 @@ class EmbyMediaImageManager(_PluginBase):
                             }
                         ],
                     },
-                    self._path_field(
-                        "audit_paths",
-                        "检查目录兜底（可选）",
-                        "只有没有选择媒体库时才使用；每行一个宿主可访问路径。",
-                        md=7,
-                    ),
+            self._path_field(
+                "audit_paths",
+                "检查目录兜底（可选）",
+                "只有没有选择媒体库时才使用；每行一个宿主可访问路径。",
+                md=7,
+            ),
+                ],
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mt-4"},
+                "content": [
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "d-flex flex-wrap align-center ga-3"},
+                        "content": [
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "primary",
+                                    "variant": "elevated",
+                                    "prepend-icon": "mdi-play-circle-outline",
+                                },
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/EmbyMediaImageManager/image-check/scan",
+                                        "method": "POST",
+                                    }
+                                },
+                                "text": "立即检查一次",
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-body-2 text-medium-emphasis"},
+                                "text": "按当前存量检查媒体库和目录配置立即执行；正在检查时不会重复启动。",
+                            },
+                        ],
+                    }
                 ],
             },
         ]
@@ -2481,9 +2527,35 @@ class EmbyMediaImageManager(_PluginBase):
             logger.error("Emby图片管理刮削失败：%s - %s", path, err, exc_info=True)
             return False
 
-    def run_audit(self) -> None:
+    def api_start_image_check(self) -> schemas.Response:
+        """立即后台执行一次存量图片检查，不要求开启定时计划。"""
+        if not self._enabled:
+            return schemas.Response(success=False, message="请先启用插件")
+        with self._lock:
+            worker = getattr(self, "_audit_worker", None)
+            if worker and worker.is_alive():
+                return schemas.Response(success=False, message="存量图片检查正在运行")
+            self._stop_event.clear()
+            self._audit_worker = threading.Thread(
+                target=self._run_manual_audit,
+                daemon=True,
+                name=f"{self.__class__.__name__}-image-check",
+            )
+            self._audit_worker.start()
+        return schemas.Response(success=True, message="存量图片检查已开始")
+
+    def _run_manual_audit(self) -> None:
+        """后台线程入口，确保立即检查结束后释放线程引用。"""
+        try:
+            self.run_audit(manual=True)
+        finally:
+            with self._lock:
+                if getattr(self, "_audit_worker", None) is threading.current_thread():
+                    self._audit_worker = None
+
+    def run_audit(self, manual: bool = False) -> None:
         """扫描指定库，仅在发现简体中文候选后覆盖刮削。"""
-        if not self._enabled or not self._audit_enabled or self._stop_event.is_set():
+        if not self._enabled or (not self._audit_enabled and not manual) or self._stop_event.is_set():
             return
         audit_lock = self._audit_lock
         stop_event = self._stop_event

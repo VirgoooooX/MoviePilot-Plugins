@@ -63,13 +63,47 @@ class EmbyMediaImageManager(_PluginBase):
     plugin_name = "Emby媒体图片管理"
     plugin_desc = "Emby入库后实时刮削、检查存量图片，并刷新现有合集封面与徽标。"
     plugin_icon = "image-search-outline"
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.3"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     plugin_label = "媒体服务器,元数据"
     plugin_config_prefix = "embymediaimagemanager_"
     plugin_order = 30
     auth_level = 1
+
+    _AUDIT_NOW_JS = """async (event) => {
+  model.audit_feedback = '正在启动存量图片检查…';
+  try {
+    const res = await window.MoviePilotAPI.post('plugin/__PLUGIN_ID__/image-check/scan', {});
+    model.audit_feedback = (res && res.message) ? res.message : '存量图片检查已开始';
+  } catch (err) {
+    model.audit_feedback = '启动失败：' + ((err && err.message) ? err.message : String(err));
+  }
+}"""
+    _COLLECTION_SCAN_JS = """async (event) => {
+  model.collection_feedback = '正在启动合集图片刷新…';
+  try {
+    const res = await window.MoviePilotAPI.post('plugin/__PLUGIN_ID__/collection-artwork/scan', {
+      server: model.collection_artwork_server || '',
+      scope: model.collection_artwork_scope || 'all',
+      libraries: model.collection_artwork_libraries || [],
+      collections: model.collection_artwork_collections || [],
+      overwrite_poster: !!model.collection_artwork_overwrite_poster,
+      overwrite_logo: !!model.collection_artwork_overwrite_logo
+    });
+    model.collection_feedback = (res && res.message) ? res.message : '合集图片刷新已开始';
+  } catch (err) {
+    model.collection_feedback = '启动失败：' + ((err && err.message) ? err.message : String(err));
+  }
+}"""
+    _COLLECTION_CANCEL_JS = """async (event) => {
+  try {
+    const res = await window.MoviePilotAPI.post('plugin/__PLUGIN_ID__/collection-artwork/cancel', {});
+    model.collection_feedback = (res && res.message) ? res.message : '已请求取消';
+  } catch (err) {
+    model.collection_feedback = '取消失败：' + ((err && err.message) ? err.message : String(err));
+  }
+}"""
 
     DEFAULT_AUDIT_CRON = "0 4 1 * *"
     SIMPLIFIED_IMAGE_PRIORITIES = {
@@ -748,6 +782,10 @@ class EmbyMediaImageManager(_PluginBase):
             server_items = []
 
         library_items = self._library_options()
+        plugin_id = self.__class__.__name__
+        audit_now_js = self._AUDIT_NOW_JS.replace("__PLUGIN_ID__", plugin_id)
+        collection_scan_js = self._COLLECTION_SCAN_JS.replace("__PLUGIN_ID__", plugin_id)
+        collection_cancel_js = self._COLLECTION_CANCEL_JS.replace("__PLUGIN_ID__", plugin_id)
         defaults = {
             "enabled": False,
             "realtime_enabled": True,
@@ -771,6 +809,8 @@ class EmbyMediaImageManager(_PluginBase):
             "collection_artwork_collections": [],
             "collection_artwork_overwrite_poster": False,
             "collection_artwork_overwrite_logo": False,
+            "audit_feedback": "",
+            "collection_feedback": "",
             "active_tab": "realtime",
         }
         realtime_content = [
@@ -880,12 +920,7 @@ class EmbyMediaImageManager(_PluginBase):
                                     "color": "primary",
                                     "variant": "elevated",
                                     "prepend-icon": "mdi-play-circle-outline",
-                                },
-                                "events": {
-                                    "click": {
-                                        "api": "plugin/EmbyMediaImageManager/image-check/scan",
-                                        "method": "POST",
-                                    }
+                                    "onClick": audit_now_js,
                                 },
                                 "text": "立即检查一次",
                             },
@@ -893,6 +928,16 @@ class EmbyMediaImageManager(_PluginBase):
                                 "component": "div",
                                 "props": {"class": "text-body-2 text-medium-emphasis"},
                                 "text": "按当前存量检查媒体库和目录配置立即执行；正在检查时不会重复启动。",
+                            },
+                            {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "audit_feedback",
+                                    "label": "操作状态",
+                                    "readonly": True,
+                                    "variant": "plain",
+                                    "hide-details": True,
+                                },
                             },
                         ],
                     }
@@ -1041,12 +1086,7 @@ class EmbyMediaImageManager(_PluginBase):
                                     "color": "primary",
                                     "variant": "elevated",
                                     "prepend-icon": "mdi-image-sync-outline",
-                                },
-                                "events": {
-                                    "click": {
-                                        "api": "plugin/EmbyMediaImageManager/collection-artwork/scan",
-                                        "method": "POST",
-                                    }
+                                    "onClick": collection_scan_js,
                                 },
                                 "text": "开始刷新合集图片",
                             },
@@ -1056,12 +1096,7 @@ class EmbyMediaImageManager(_PluginBase):
                                     "color": "warning",
                                     "variant": "tonal",
                                     "prepend-icon": "mdi-stop-circle-outline",
-                                },
-                                "events": {
-                                    "click": {
-                                        "api": "plugin/EmbyMediaImageManager/collection-artwork/cancel",
-                                        "method": "POST",
-                                    }
+                                    "onClick": collection_cancel_js,
                                 },
                                 "text": "取消任务",
                             },
@@ -1069,6 +1104,16 @@ class EmbyMediaImageManager(_PluginBase):
                                 "component": "div",
                                 "props": {"class": "text-body-2 text-medium-emphasis"},
                                 "text": "任务进度、成功/失败/跳过数量和每个合集的回读结果可在插件状态页查看。",
+                            },
+                            {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "collection_feedback",
+                                    "label": "操作状态",
+                                    "readonly": True,
+                                    "variant": "plain",
+                                    "hide-details": True,
+                                },
                             },
                         ],
                     }
@@ -2045,7 +2090,7 @@ class EmbyMediaImageManager(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回实时、存量检查与合集图片任务状态页面。"""
+        """返回实时与存量图片检查状态页面。"""
         with getattr(self, "_lock", threading.RLock()):
             pending_count = len(getattr(self, "_pending", {}))
         collection_job = self._collection_job()
@@ -2114,14 +2159,6 @@ class EmbyMediaImageManager(_PluginBase):
                                         "props": {"variant": "tonal"},
                                         "text": audit_scope,
                                     },
-                                    {
-                                        "component": "VChip",
-                                        "props": {"variant": "tonal"},
-                                        "text": (
-                                            f"合集图片{'运行中' if collection_job.get('running') else '空闲'}"
-                                            f" · {collection_job.get('success', 0)} 成功"
-                                        ),
-                                    },
                                     {"component": "VSpacer"},
                                     {
                                         "component": "div",
@@ -2136,6 +2173,9 @@ class EmbyMediaImageManager(_PluginBase):
                     },
                     {
                         "component": "VRow",
+                        "props": {
+                            "class": "flex-nowrap overflow-x-auto ga-2",
+                        },
                         "content": [
                             self._stat_card(
                                 "待处理事件", pending_count, "mdi-timer-sand", "primary"
@@ -2176,148 +2216,22 @@ class EmbyMediaImageManager(_PluginBase):
                             "class": "mt-2 white-space-pre-line",
                         },
                     },
-                    self._collection_status_card(collection_job),
                 ],
             }
         ]
-
-    @classmethod
-    def _collection_status_card(cls, job: dict) -> dict:
-        """渲染合集图片进度及最近逐合集结果。"""
-        details = job.get("details") if isinstance(job, dict) else []
-        details = details if isinstance(details, list) else []
-        cards = []
-        for row in details[-20:]:
-            if not isinstance(row, dict):
-                continue
-            status = str(row.get("status") or "skipped")
-            color = {"success": "success", "failed": "error", "skipped": "warning"}.get(
-                status, "info"
-            )
-            poster = row.get("poster") or {}
-            logo = row.get("logo") or {}
-            def artwork_text(value: Any) -> str:
-                if not value:
-                    return "无候选"
-                source = value.get("source") or "未知来源"
-                language = value.get("language") or "未知语言"
-                verification = value.get("verification") or value.get("status") or "未处理"
-                return f"{source} / {language} · {verification}"
-
-            cards.append(
-                {
-                    "component": "VCard",
-                    "props": {"variant": "tonal", "class": "mb-2"},
-                    "content": [
-                        {
-                            "component": "VCardText",
-                            "content": [
-                                {
-                                    "component": "div",
-                                    "props": {"class": "text-subtitle-2 font-weight-bold"},
-                                    "text": f"{row.get('name') or '未命名合集'} · TMDB {row.get('tmdb_id') or '无'}",
-                                },
-                                {
-                                    "component": "div",
-                                    "props": {"class": "text-caption text-medium-emphasis mt-1"},
-                                    "text": f"poster：{artwork_text(poster)}；Logo：{artwork_text(logo)}",
-                                },
-                                {
-                                    "component": "VChip",
-                                    "props": {"size": "small", "color": color, "variant": "tonal", "class": "mt-2"},
-                                    "text": row.get("message") or status,
-                                },
-                            ],
-                        }
-                    ],
-                }
-            )
-        total = int(job.get("total") or 0)
-        current = int(job.get("current") or 0)
-        progress = int(job.get("progress") or 0)
-        content: List[dict] = [
-            {
-                "component": "VCardTitle",
-                "text": "合集图片任务",
-            },
-            {
-                "component": "VCardActions",
-                "content": [
-                    {
-                        "component": "VBtn",
-                        "props": {
-                            "color": "primary",
-                            "variant": "tonal",
-                            "prepend-icon": "mdi-image-sync-outline",
-                        },
-                        "events": {
-                            "click": {
-                                "api": "plugin/EmbyMediaImageManager/collection-artwork/scan",
-                                "method": "POST",
-                            }
-                        },
-                        "text": "开始刷新合集图片",
-                    },
-                    {
-                        "component": "VBtn",
-                        "props": {
-                            "color": "warning",
-                            "variant": "text",
-                            "prepend-icon": "mdi-stop-circle-outline",
-                        },
-                        "events": {
-                            "click": {
-                                "api": "plugin/EmbyMediaImageManager/collection-artwork/cancel",
-                                "method": "POST",
-                            }
-                        },
-                        "text": "取消",
-                    },
-                ],
-            },
-            {
-                "component": "VCardText",
-                "content": [
-                    {
-                        "component": "VProgressLinear",
-                        "props": {"model-value": progress, "color": "primary", "height": 8, "rounded": True},
-                    },
-                    {
-                        "component": "div",
-                        "props": {"class": "text-caption text-medium-emphasis mt-2"},
-                        "text": f"{job.get('message') or '尚未运行'} · {current}/{total} · poster {job.get('poster_success', 0)} · Logo {job.get('logo_success', 0)} · 跳过 {job.get('skipped', 0)} · 失败 {job.get('failed', 0)}",
-                    },
-                ],
-            },
-        ]
-        if cards:
-            content.append(
-                {
-                    "component": "VExpansionPanels",
-                    "props": {"variant": "accordion"},
-                    "content": [
-                        {
-                            "component": "VExpansionPanel",
-                            "content": [
-                                {"component": "VExpansionPanelTitle", "text": "最近合集结果"},
-                                {"component": "VExpansionPanelText", "content": cards},
-                            ],
-                        }
-                    ],
-                }
-            )
-        return {
-            "component": "VCard",
-            "props": {"variant": "outlined", "class": "mt-4 rounded-lg"},
-            "content": content,
-        }
 
     @staticmethod
     def _stat_card(label: str, value: Any, icon: str, color: str) -> dict:
         """生成状态页统计卡片。"""
         return {
             "component": "VCol",
-            "props": {"cols": 6, "md": 3},
+            "props": {
+                "cols": 12,
+                "sm": 6,
+                "md": 2,
+                "class": "flex-grow-1",
+                "style": "flex: 1 1 0; max-width: 20%; min-width: 180px;",
+            },
             "content": [
                 {
                     "component": "VCard",

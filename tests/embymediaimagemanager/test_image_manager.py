@@ -435,6 +435,97 @@ def test_form_exposes_collection_artwork_tab_and_api(monkeypatch):
     assert "/collection-artwork/cancel" in paths
     assert "/image-check/scan" in paths
 
+    page = plugin.get_page()
+    page_text = [node.get("text") for node in walk(page)]
+    assert "合集图片任务" not in page_text
+    stat_rows = [node for node in walk(page) if node.get("component") == "VRow"]
+    assert any(
+        node.get("props", {}).get("class") == "flex-nowrap overflow-x-auto ga-2"
+        for node in stat_rows
+    )
+    assert sum(
+        1
+        for node in walk(page)
+        if node.get("component") == "VCardTitle" and node.get("text") == "合集图片任务"
+    ) == 0
+
+
+def test_collection_scan_button_uses_form_model_and_real_api(monkeypatch):
+    class Helper:
+        def get_services(self, **_kwargs):
+            return {}
+
+        def get_configs(self):
+            return {}
+
+    monkeypatch.setattr(MODULE, "MediaServerHelper", Helper)
+    plugin = _plugin()
+    form, _ = plugin.get_form()
+
+    def walk(node):
+        if isinstance(node, dict):
+            yield node
+            for child in node.get("content") or []:
+                yield from walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                yield from walk(child)
+
+    buttons = [
+        node for node in walk(form)
+        if node.get("component") == "VBtn" and node.get("text") == "开始刷新合集图片"
+    ]
+    assert len(buttons) == 1
+    on_click = buttons[0].get("props", {}).get("onClick") or ""
+    assert "MoviePilotAPI.post" in on_click
+    assert "/collection-artwork/scan" in on_click
+    assert "collection_artwork_scope" in on_click
+    assert "collection_artwork_collections" in on_click
+
+
+def test_collection_scan_api_starts_worker_with_current_scope(monkeypatch):
+    class Instance:
+        pass
+
+    class Service:
+        instance = Instance()
+
+    class Helper:
+        def get_services(self, **_kwargs):
+            return {"LivingRoom": Service()}
+
+    class FakeThread:
+        def __init__(self, target, args, **_kwargs):
+            self.target = target
+            self.args = args
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return self.started
+
+    monkeypatch.setattr(MODULE, "MediaServerHelper", Helper)
+    monkeypatch.setattr(MODULE.threading, "Thread", FakeThread)
+    plugin = _plugin({"enabled": True})
+    response = plugin.api_start_collection_artwork_scan(
+        {
+            "server": "LivingRoom",
+            "scope": "collections",
+            "collections": ["box-1"],
+            "overwrite_poster": True,
+            "overwrite_logo": False,
+        }
+    )
+    assert response.success is True
+    worker = plugin._collection_worker
+    assert worker.started is True
+    assert worker.args[0] == "LivingRoom"
+    assert worker.args[2] == "collections"
+    assert worker.args[4] == ["box-1"]
+    assert worker.args[5:] == (True, False)
+
 
 def test_manual_image_check_starts_background_worker(monkeypatch):
     plugin = _plugin({"enabled": True, "audit_enabled": False})

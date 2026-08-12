@@ -212,7 +212,7 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.3.1`
+`v1.3.3`
 
 ### Emby媒体图片管理（EmbyMediaImageManager）
 
@@ -227,7 +227,8 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 - **简体图片检查**：按检查计划扫描所选媒体库，发现简体中文候选后覆盖刮削并刷新 Emby。
 - **立即检查**：存量图片检查页支持点击“立即检查一次”，按当前配置后台执行，并与定时检查互斥。
 - **合集图片刷新**：新增“合集图片”Tab，只读取现有 Emby BoxSet，按 TMDB/Fanart 海报优先级分别更新 poster 和 Logo，不创建、删除或改动合集成员；上传后回读 ImageTags 验证。
-- **安全运行状态**：存量检查和合集图片任务互斥执行、分批保存进度；详情页展示待处理事件、已补齐媒体、合集成功/跳过/失败和最近结果。
+- **安全运行状态**：存量检查和合集图片任务互斥执行、分批保存进度；数据页展示实时与存量检查概况，合集页反馈刷新任务状态。
+- **数据页简洁展示**：数据页保留五个核心统计卡片并固定单行，合集图片任务详情留在“合集图片”配置页。
 
 #### 使用前提
 
@@ -245,7 +246,7 @@ https://raw.githubusercontent.com/VirgoooooX/MoviePilot-Plugins/main/package.v2.
 
 #### 当前版本
 
-`v1.3.1`
+`v1.3.3`
 
 ## 目录结构
 

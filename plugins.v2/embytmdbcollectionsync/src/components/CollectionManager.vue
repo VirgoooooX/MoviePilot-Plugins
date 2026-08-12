@@ -172,7 +172,7 @@ function confirmApply() {
           <VCol cols="12" sm="6" md="3"><VSwitch v-model="config.sync_logo" label="同步合集徽标" color="primary" /></VCol>
         </VRow>
         <VAlert class="mt-1" type="info" variant="tonal" density="comfortable">
-          插件会识别 TMDB 合集缺片并支持一键订阅。已接管合集若被用户手工改名或调整成员，会自动转为“人工合集保护”，其中电影不再被分配到其它合集。
+          插件会识别 TMDB 合集缺片并支持一键订阅。合集 Poster 和 Logo 使用 TMDB，均排除繁体候选；已接管合集若被用户手工改名或调整成员，会自动转为“人工合集保护”。
         </VAlert>
         <div class="d-flex flex-wrap ga-3 mt-3">
           <VBtn prepend-icon="mdi-content-save" color="primary" variant="tonal" :loading="saving" @click="emit('save')">保存设置</VBtn>

@@ -307,6 +307,21 @@ def test_tmdb_image_language_supports_composite_and_split_regions():
     assert EmbyTmdbCollectionSync._pick_tmdb_image(images) == ("/cn.jpg", "zh-CN")
 
 
+def test_tmdb_collection_image_priority_excludes_traditional_regions():
+    images = [
+        {"file_path": "/tw.jpg", "iso_639_1": "zh-TW", "vote_average": 10},
+        {"file_path": "/hk.jpg", "iso_639_1": "zh", "iso_3166_1": "HK", "vote_average": 9},
+        {"file_path": "/en.jpg", "iso_639_1": "en-US", "vote_average": 1},
+    ]
+    # 没有简体候选时也不能回退到繁体，按海报优先插件规则继续走英文/无语言层。
+    assert EmbyTmdbCollectionSync._pick_tmdb_image(images) == ("/en.jpg", "en")
+    assert EmbyTmdbCollectionSync._tmdb_image_language_priority(images[0]) > (
+        EmbyTmdbCollectionSync._tmdb_image_language_priority(images[2])
+    )
+    assert EmbyTmdbCollectionSync._pick_tmdb_image(images[:2]) == (None, None)
+    assert EmbyTmdbCollectionSync._is_traditional_tmdb_image({"iso_639_1": "zh-Hant"}) is True
+
+
 def test_member_snapshot_is_order_independent_and_detects_changes():
     first = [{"Id": "2"}, {"Id": "1"}]
     second = [{"Id": "1"}, {"Id": "2"}]
@@ -600,7 +615,9 @@ def test_collection_images_explicitly_requests_all_chinese_regions(monkeypatch):
     module = sys.modules[EmbyTmdbCollectionSync.__module__]
     monkeypatch.setattr(module, "RequestUtils", Request)
     assert EmbyTmdbCollectionSync._query_collection_images(550) == {"posters": []}
-    assert calls["params"]["include_image_language"] == EmbyTmdbCollectionSync.COLLECTION_IMAGE_LANGUAGES
+    assert calls["params"]["include_image_language"] == "zh-CN,zh-SG,zh,en-US,en,null"
+    assert "zh-TW" not in calls["params"]["include_image_language"]
+    assert "zh-HK" not in calls["params"]["include_image_language"]
     assert calls["params"]["language"] == "zh-CN"
 
 

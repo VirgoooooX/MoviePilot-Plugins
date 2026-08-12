@@ -391,6 +391,43 @@ def test_form_exposes_library_selection_and_removes_webhook_source(monkeypatch):
     assert any(node.get("component") == "VWindow" for node in walk(form))
 
 
+def test_form_exposes_collection_artwork_tab_and_api(monkeypatch):
+    class Helper:
+        def get_services(self, **_kwargs):
+            return {}
+
+        def get_configs(self):
+            return {}
+
+    monkeypatch.setattr(MODULE, "MediaServerHelper", Helper)
+    plugin = _plugin()
+    form, defaults = plugin.get_form()
+    assert defaults["collection_artwork_scope"] == "all"
+    assert defaults["collection_artwork_overwrite_poster"] is False
+    assert defaults["collection_artwork_overwrite_logo"] is False
+
+    def walk(node):
+        if isinstance(node, dict):
+            yield node
+            for child in node.get("content") or []:
+                yield from walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                yield from walk(child)
+
+    fields = [node.get("props", {}).get("model") for node in walk(form)]
+    texts = [node.get("text") for node in walk(form)]
+    assert "collection_artwork_server" in fields
+    assert "collection_artwork_scope" in fields
+    assert "collection_artwork_libraries" in fields
+    assert "collection_artwork_collections" in fields
+    assert "合集图片" in texts
+    paths = {item["path"] for item in plugin.get_api()}
+    assert "/collection-artwork/scan" in paths
+    assert "/collection-artwork/status" in paths
+    assert "/collection-artwork/cancel" in paths
+
+
 def test_scrape_failure_does_not_refresh_emby(tmp_path):
     plugin = _plugin()
     plugin._pending["job"] = {"path": str(tmp_path), "server": "Emby", "item_id": "1"}
@@ -427,3 +464,92 @@ def test_audit_rejects_overlapping_run():
         assert plugin._audit_running is False
     finally:
         plugin._audit_lock.release()
+
+
+def test_collection_upload_uses_base64_and_verifies_image_tag(monkeypatch):
+    plugin = _plugin()
+    calls = []
+
+    class ImageResponse:
+        status_code = 200
+        content = b"image-bytes"
+        headers = {"Content-Type": "image/jpeg"}
+
+    class UploadResponse:
+        status_code = 204
+
+    class ItemResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"ImageTags": {"Primary": "tag-1"}}
+
+    class Request:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get_res(self, _url, **_kwargs):
+            return ImageResponse()
+
+    class Instance:
+        def post_data(self, **kwargs):
+            calls.append(kwargs)
+            return UploadResponse()
+
+        def get_data(self, **_kwargs):
+            return ItemResponse()
+
+    class Service:
+        instance = Instance()
+
+    monkeypatch.setattr(MODULE, "RequestUtils", Request)
+    result = plugin._upload_collection_image(Service(), "box-1", "Primary", "https://img.test/a.jpg")
+
+    assert result["verification"] == "Emby ImageTags 回读成功"
+    assert calls[0]["headers"]["Content-Type"] == "image/jpeg"
+    assert calls[0]["data"] == "aW1hZ2UtYnl0ZXM="
+
+
+def test_collection_upload_rejects_http_success_without_readback(monkeypatch):
+    plugin = _plugin()
+
+    class ImageResponse:
+        status_code = 200
+        content = b"image-bytes"
+        headers = {"Content-Type": "image/png"}
+
+    class UploadResponse:
+        status_code = 204
+
+    class ItemResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"ImageTags": {}}
+
+    class Request:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get_res(self, _url, **_kwargs):
+            return ImageResponse()
+
+    class Instance:
+        def post_data(self, **_kwargs):
+            return UploadResponse()
+
+        def get_data(self, **_kwargs):
+            return ItemResponse()
+
+    class Service:
+        instance = Instance()
+
+    monkeypatch.setattr(MODULE, "RequestUtils", Request)
+    try:
+        plugin._upload_collection_image(Service(), "box-1", "Logo", "https://img.test/a.png")
+    except RuntimeError as err:
+        assert "回读 ImageTags" in str(err)
+    else:
+        raise AssertionError("缺少 ImageTags 回读时应判定上传失败")

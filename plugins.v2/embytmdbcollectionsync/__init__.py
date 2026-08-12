@@ -28,7 +28,7 @@ class EmbyTmdbCollectionSync(_PluginBase):
     plugin_name = "Emby TMDB 合集整理"
     plugin_desc = "按 TMDB 官方合集整理 Emby 电影。"
     plugin_icon = "TheMovieDb_A.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     plugin_label = "媒体服务器,元数据"
@@ -44,7 +44,8 @@ class EmbyTmdbCollectionSync(_PluginBase):
     CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
     CACHE_MAX_ENTRIES = 2000
     CACHE_FLUSH_INTERVAL = 100
-    COLLECTION_IMAGE_LANGUAGES = "zh-CN,zh-SG,zh-TW,zh-HK,zh,en-US,en,null"
+    # 与 TMDB/Fanart 海报优先插件一致：不请求或选择繁体地区层，避免合集封面和徽标落到 zh-TW/zh-HK。
+    COLLECTION_IMAGE_LANGUAGES = "zh-CN,zh-SG,zh,en-US,en,null"
 
     def init_plugin(self, config: Optional[dict] = None) -> None:
         """读取插件配置并初始化互斥状态。"""
@@ -1162,7 +1163,7 @@ class EmbyTmdbCollectionSync(_PluginBase):
         return data["Items"]
 
     def _collection_metadata(self, collection_id: int, seed: dict) -> Dict[str, Any]:
-        """按 zh-CN、zh-SG、zh-TW、zh-HK、英文顺序解析合集名称和 TMDB 图片。"""
+        """按 zh-CN、zh-SG、泛中文、英文顺序解析合集名称和 TMDB 图片，排除繁体地区图片。"""
         try:
             translations = self._tmdb_zh_cn.collection.translations(collection_id) or []
         except Exception:
@@ -1313,12 +1314,15 @@ class EmbyTmdbCollectionSync(_PluginBase):
 
     @staticmethod
     def _pick_tmdb_image(images: List[dict]) -> Tuple[Optional[str], Optional[str]]:
-        """按 zh-CN、zh-SG、zh-TW、zh-HK、泛 zh、英文、无语言排序 TMDB 图片。"""
+        """按 zh-CN、zh-SG、泛 zh、英文、无语言排序 TMDB 图片，并排除繁体地区候选。"""
         def priority(image: dict) -> int:
             """返回兼容复合语言和独立地区字段的图片优先级。"""
             return EmbyTmdbCollectionSync._tmdb_image_language_priority(image)
 
-        candidates = sorted(images, key=lambda image: (
+        candidates = sorted((
+            image for image in images
+            if not EmbyTmdbCollectionSync._is_traditional_tmdb_image(image)
+        ), key=lambda image: (
             priority(image),
             -(image.get("vote_average") or 0),
             -(image.get("vote_count") or 0),
@@ -1329,6 +1333,19 @@ class EmbyTmdbCollectionSync(_PluginBase):
         chosen = candidates[0]
         label = EmbyTmdbCollectionSync._normalize_tmdb_image_language(chosen)
         return chosen.get("file_path"), label
+
+    @staticmethod
+    def _is_traditional_tmdb_image(image: dict) -> bool:
+        """识别 zh-TW/zh-HK 及 zh-Hant 脚本标签，避免繁体候选绕过地区规范化。"""
+        if not isinstance(image, dict):
+            return False
+        raw_language = str(image.get("iso_639_1") or "").strip().lower().replace("_", "-").replace("+", "-")
+        raw_region = str(image.get("iso_3166_1") or "").strip().upper().replace("_", "-")
+        return (
+            raw_language in {"zh-tw", "zh-hk", "zh-hant"}
+            or raw_language.startswith("zh-hant-")
+            or raw_region in {"TW", "HK"}
+        )
 
     @staticmethod
     def _normalize_tmdb_image_language(image: dict) -> str:
@@ -1366,11 +1383,9 @@ class EmbyTmdbCollectionSync(_PluginBase):
         return {
             "zh-CN": 0,
             "zh-SG": 1,
-            "zh-TW": 2,
-            "zh-HK": 3,
-            "zh": 4,
-            "en": 5,
-            "null": 6,
+            "zh": 2,
+            "en": 3,
+            "null": 4,
         }.get(label, 9)
 
     def _validate_plan_row(self, service: Any, row: dict) -> Tuple[Optional[str], str]:

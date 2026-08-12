@@ -1,14 +1,17 @@
-"""Emby 入库实时刮削与媒体图片审计插件。"""
+"""Emby 入库实时刮削、存量图片检查与合集图片管理插件。"""
 
 from __future__ import annotations
 
+import base64
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from apscheduler.triggers.cron import CronTrigger
+from fastapi import Body
 
 from app import schemas
 from app.chain.media import MediaChain
@@ -21,14 +24,46 @@ from app.schemas import RefreshMediaItem, ServiceInfo, WebhookEventInfo
 from app.schemas.types import EventType, MediaType
 from app.utils.system import SystemUtils
 
+try:
+    from app.utils.http import RequestUtils
+except ImportError:  # pragma: no cover - 最小单元测试桩不提供 HTTP 模块
+    RequestUtils = None
+
+try:
+    from .collection_artwork import (
+        DEFAULT_PRIORITY as COLLECTION_DEFAULT_PRIORITY,
+        normalize_fanart_payload,
+        normalize_priority,
+        priority_preview,
+        select_collection_images,
+    )
+except (ImportError, ValueError):  # pragma: no cover - 直接按文件加载插件时使用
+    import importlib.util
+
+    _collection_artwork_path = Path(__file__).with_name("collection_artwork.py")
+    _collection_artwork_spec = importlib.util.spec_from_file_location(
+        "embymediaimagemanager_collection_artwork", _collection_artwork_path
+    )
+    if not _collection_artwork_spec or not _collection_artwork_spec.loader:
+        raise ImportError("无法加载合集图片选择模块")
+    _collection_artwork_module = importlib.util.module_from_spec(
+        _collection_artwork_spec
+    )
+    _collection_artwork_spec.loader.exec_module(_collection_artwork_module)
+    COLLECTION_DEFAULT_PRIORITY = _collection_artwork_module.DEFAULT_PRIORITY
+    normalize_fanart_payload = _collection_artwork_module.normalize_fanart_payload
+    normalize_priority = _collection_artwork_module.normalize_priority
+    priority_preview = _collection_artwork_module.priority_preview
+    select_collection_images = _collection_artwork_module.select_collection_images
+
 
 class EmbyMediaImageManager(_PluginBase):
-    """处理 Emby 外部入库实时刮削与指定媒体库图片审计。"""
+    """处理 Emby 外部入库实时刮削、存量图片检查与合集图片。"""
 
     plugin_name = "Emby媒体图片管理"
-    plugin_desc = "Emby入库后实时刮削，并按目标媒体库周期审计简体中文图片。"
+    plugin_desc = "Emby入库后实时刮削、检查存量图片，并刷新现有合集封面与徽标。"
     plugin_icon = "image-search-outline"
-    plugin_version = "1.2.2"
+    plugin_version = "1.3.0"
     plugin_author = "VirgoooooX"
     author_url = "https://github.com/VirgoooooX/MoviePilot-Plugins"
     plugin_label = "媒体服务器,元数据"
@@ -43,6 +78,8 @@ class EmbyMediaImageManager(_PluginBase):
         "fanart_chinese",
     }
     DATA_STATES = "states"
+    DATA_COLLECTION_JOB = "collection_artwork_job"
+    COLLECTION_IMAGE_LANGUAGES = "zh-CN,zh-SG,zh,en-US,en,null"
 
     _enabled = False
     _realtime_enabled = True
@@ -60,6 +97,12 @@ class EmbyMediaImageManager(_PluginBase):
     _audit_libraries: List[str] = []
     _emby_path_prefix = ""
     _local_path_prefix = ""
+    _collection_server = ""
+    _collection_scope = "all"
+    _collection_libraries: List[str] = []
+    _collection_ids: List[str] = []
+    _collection_overwrite_poster = False
+    _collection_overwrite_logo = False
 
     def init_plugin(self, config: Optional[dict] = None) -> None:
         """读取并规范化配置，同时清理上一轮延迟任务。"""
@@ -82,12 +125,35 @@ class EmbyMediaImageManager(_PluginBase):
         self._exclude_paths = str(config.get("exclude_paths") or "").strip()
         self._emby_path_prefix = str(config.get("emby_path_prefix") or "").strip()
         self._local_path_prefix = str(config.get("local_path_prefix") or "").strip()
+        self._collection_server = str(
+            config.get("collection_artwork_server")
+            or config.get("collection_server")
+            or ""
+        ).strip()
+        scope = str(
+            config.get("collection_artwork_scope")
+            or config.get("collection_scope")
+            or "all"
+        ).strip().lower()
+        self._collection_scope = scope if scope in {"all", "libraries", "collections"} else "all"
+        collection_libraries = config.get("collection_artwork_libraries") or []
+        collection_ids = config.get("collection_artwork_collections") or config.get(
+            "collection_artwork_ids"
+        ) or []
+        self._collection_libraries = self._dedupe_values(collection_libraries)
+        self._collection_ids = self._dedupe_values(collection_ids)
+        self._collection_overwrite_poster = bool(
+            config.get("collection_artwork_overwrite_poster", False)
+        )
+        self._collection_overwrite_logo = bool(
+            config.get("collection_artwork_overwrite_logo", False)
+        )
         value = config.get("mediaservers") or []
         values = value if isinstance(value, list) else str(value).splitlines()
         self._mediaservers = list(
             dict.fromkeys(str(item).strip() for item in values if str(item).strip())
         )
-        # 旧版只有一个 media_libraries，迁移到审计范围；实时范围按新约定默认全量。
+        # 旧版只有一个 media_libraries，迁移到存量图片检查范围；实时范围按新约定默认全量。
         legacy_libraries = (
             config.get("media_libraries", config.get("libraries", [])) or []
         )
@@ -114,7 +180,7 @@ class EmbyMediaImageManager(_PluginBase):
             )
         )
         self._lock = threading.RLock()
-        # 保留同一把审计锁，避免插件热重载时新旧审计并行。
+        # 保留同一把检查锁，避免插件热重载时新旧检查并行。
         self._audit_lock = getattr(self, "_audit_lock", threading.Lock())
         self._stop_event = threading.Event()
         self._pending: Dict[str, dict] = {}
@@ -124,8 +190,18 @@ class EmbyMediaImageManager(_PluginBase):
         self._last_realtime_at = ""
         self._last_realtime_result = "尚未处理入库事件"
         self._last_audit_at = ""
-        self._last_audit_result = "尚未执行图片审计"
+        self._last_audit_result = "尚未执行存量图片检查"
         self._audit_running = False
+        self._collection_lock = getattr(self, "_collection_lock", threading.RLock())
+        previous_worker = getattr(self, "_collection_worker", None)
+        previous_stop_event = getattr(self, "_collection_stop_event", None)
+        if previous_worker and previous_worker.is_alive():
+            # 热重载等待超时后不能丢掉旧线程引用，否则新配置可能再启动第二个写入任务。
+            self._collection_worker = previous_worker
+            self._collection_stop_event = previous_stop_event or threading.Event()
+        else:
+            self._collection_worker = None
+            self._collection_stop_event = threading.Event()
 
     def _load_library_catalog(self, force: bool = False) -> Dict[str, dict]:
         """读取 Emby 媒体库及其物理路径，短时缓存避免每个 Webhook 都请求服务。"""
@@ -372,7 +448,7 @@ class EmbyMediaImageManager(_PluginBase):
     def _audit_roots(
         self, stop_event: Optional[threading.Event] = None
     ) -> List[Tuple[Path, List[str]]]:
-        """返回审计根目录及对应实例，库路径为空时按媒体库 ID 查询条目路径。"""
+        """返回存量检查根目录及对应实例，库路径为空时按媒体库 ID 查询条目路径。"""
         roots: Dict[str, Dict[str, Any]] = {}
         if self._audit_libraries:
             catalog = self._load_library_catalog()
@@ -528,10 +604,125 @@ class EmbyMediaImageManager(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         """返回插件 API 列表。"""
-        return []
+        return [
+            {
+                "path": "/collection-artwork/scan",
+                "endpoint": self.api_start_collection_artwork_scan,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "刷新合集图片",
+                "description": "只更新现有 Emby 合集的 poster 和 Logo，不改合集成员。",
+            },
+            {
+                "path": "/collection-artwork/status",
+                "endpoint": self.api_collection_artwork_status,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取合集图片任务状态",
+            },
+            {
+                "path": "/collection-artwork/cancel",
+                "endpoint": self.api_cancel_collection_artwork,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "取消合集图片任务",
+            },
+        ]
+
+    @staticmethod
+    def _dedupe_values(value: Any) -> List[str]:
+        """把配置中的字符串/数组规范成稳定去重的字符串数组。"""
+        values = value if isinstance(value, (list, tuple, set)) else str(value or "").splitlines()
+        return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+
+    def _collection_services(self) -> Dict[str, Any]:
+        """返回可用 Emby 实例，合集图片任务只在这些实例中读取现有合集。"""
+        try:
+            services = MediaServerHelper().get_services(type_filter="emby") or {}
+        except Exception as err:
+            logger.warning("读取合集图片的 Emby 实例失败：%s", err)
+            return {}
+        result = {}
+        for name, service in services.items():
+            instance = getattr(service, "instance", None)
+            try:
+                inactive = bool(instance and instance.is_inactive())
+            except Exception:
+                inactive = False
+            if service and instance and not inactive:
+                result[str(name)] = service
+        return result
+
+    def _resolve_collection_service(
+        self, server_name: Optional[str] = None
+    ) -> Tuple[str, Any]:
+        """按请求、配置或唯一实例解析合集图片任务目标。"""
+        services = self._collection_services()
+        selected = str(server_name or self._collection_server or "").strip()
+        if not selected and len(services) == 1:
+            selected = next(iter(services))
+        return selected, services.get(selected)
+
+    def _collection_priority(self) -> List[str]:
+        """读取 TMDB/Fanart 海报优先插件的真实配置，不复制一份配置。"""
+        priority = None
+        configured = False
+        try:
+            config = self.get_config("TmdbPosterLanguagePriority")
+            if isinstance(config, dict):
+                configured = "priority" in config
+                priority = config.get("priority")
+        except Exception as err:
+            logger.debug("读取 TMDB/Fanart 海报优先配置失败，使用默认顺序：%s", err)
+        normalized = normalize_priority(priority)
+        order = normalized if configured else COLLECTION_DEFAULT_PRIORITY.copy()
+        # 合集图片固定排除繁体地区，避免旧版海报优先配置中的 tw/hk 影响合集封面。
+        return [item for item in order if item not in {"tmdb_zh_tw", "tmdb_zh_hk"}]
+
+    def _collection_priority_text(self) -> str:
+        """返回配置页使用的当前图片优先级预览。"""
+        return f"{priority_preview(self._collection_priority())}（合集图片自动排除 zh-TW、zh-HK 繁体地区）"
+
+    def _collection_boxset_options(
+        self, server_name: Optional[str] = None, selected: Optional[List[str]] = None
+    ) -> List[dict]:
+        """生成现有 Emby 合集选择项；读取失败时保留已保存的 ID。"""
+        name, service = self._resolve_collection_service(server_name)
+        options: List[dict] = []
+        try:
+            boxsets = self._load_collection_boxsets(service) if service else []
+        except Exception as err:
+            logger.warning("读取 Emby 合集选项失败：%s", err)
+            boxsets = []
+        for item in sorted(
+            boxsets,
+            key=lambda row: str(row.get("Name") or row.get("Id") or "").casefold(),
+        ):
+            item_id = str(item.get("Id") or item.get("id") or "").strip()
+            if not item_id:
+                continue
+            tmdb_id = self._collection_tmdb_id(item) or "未识别 TMDB"
+            options.append(
+                {
+                    "title": f"{item.get('Name') or item_id} · TMDB {tmdb_id}",
+                    "value": item_id,
+                }
+            )
+        known = {item["value"] for item in options}
+        for item_id in selected or self._collection_ids:
+            if item_id not in known:
+                options.append(
+                    {"title": f"已保存的合集（当前无法读取）：{item_id}", "value": item_id}
+                )
+        if name and not options and selected:
+            return [
+                {"title": f"已保存的合集（{name}）：{item_id}", "value": item_id}
+                for item_id in selected
+            ]
+        return options
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """返回实时刮削与周期审计分离的 Tab 配置表单。"""
+        """返回实时处理、存量图片检查与合集图片分离的 Tab 配置表单。"""
         try:
             server_items = [
                 {"title": config.name, "value": config.name}
@@ -560,6 +751,12 @@ class EmbyMediaImageManager(_PluginBase):
             "exclude_paths": "",
             "emby_path_prefix": "",
             "local_path_prefix": "",
+            "collection_artwork_server": "",
+            "collection_artwork_scope": "all",
+            "collection_artwork_libraries": [],
+            "collection_artwork_collections": [],
+            "collection_artwork_overwrite_poster": False,
+            "collection_artwork_overwrite_logo": False,
             "active_tab": "realtime",
         }
         realtime_content = [
@@ -612,21 +809,21 @@ class EmbyMediaImageManager(_PluginBase):
                 "props": {
                     "type": "warning",
                     "variant": "tonal",
-                    "title": "只审计明确选择的外语媒体库",
-                    "text": "建议只选择外语电影库、外语剧库；不选择媒体库时不会扫描，除非填写审计目录兜底。",
+                    "title": "只检查明确选择的外语媒体库",
+                    "text": "建议只选择外语电影库、外语剧库；不选择媒体库时不会检查，除非填写目录兜底。",
                     "class": "mb-4",
                 },
             },
             self._form_col(
                 "audit_enabled",
-                "启用周期图片审计",
-                "按计划检查所选审计媒体库中的简体中文图片候选。",
+                "启用存量图片检查",
+                "按计划检查所选外语媒体库中的简体中文图片候选。",
                 12,
             ),
             self._library_select(
                 "audit_libraries",
-                "周期审计媒体库（建议必选）",
-                "只选择需要补中文图片的外语库；留空且未填写目录兜底时不会扫描。",
+                "存量图片检查媒体库（建议必选）",
+                "只选择需要补中文图片的外语库；留空且未填写目录兜底时不会检查。",
                 library_items,
             ),
             {
@@ -640,7 +837,7 @@ class EmbyMediaImageManager(_PluginBase):
                                 "component": "VCronField",
                                 "props": {
                                     "model": "audit_cron",
-                                    "label": "审计计划",
+                                    "label": "检查计划",
                                     "hint": "默认每月 1 日凌晨 4 点：0 4 1 * *",
                                     "persistent-hint": True,
                                 },
@@ -649,10 +846,186 @@ class EmbyMediaImageManager(_PluginBase):
                     },
                     self._path_field(
                         "audit_paths",
-                        "审计目录兜底（可选）",
-                        "只有没有选择审计媒体库时才使用；每行一个宿主可访问路径。",
+                        "检查目录兜底（可选）",
+                        "只有没有选择媒体库时才使用；每行一个宿主可访问路径。",
                         md=7,
                     ),
+                ],
+            },
+        ]
+        collection_library_items = [
+            item
+            for item in library_items
+            if str(item.get("value") or "").partition("::")[0]
+            == str(self._collection_server or "").strip()
+        ] or library_items
+        collection_items = self._collection_boxset_options(
+            self._collection_server, self._collection_ids
+        )
+        collection_content = [
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "title": "只刷新现有合集图片",
+                    "text": "这里只读取已有 Emby BoxSet，更新 poster 和 Logo；不会创建、删除、改名，也不会增删合集成员。",
+                    "class": "mb-4",
+                },
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VSelect",
+                                "props": {
+                                    "model": "collection_artwork_server",
+                                    "label": "处理 Emby 服务",
+                                    "items": server_items,
+                                    "item-title": "title",
+                                    "item-value": "value",
+                                    "clearable": True,
+                                    "variant": "outlined",
+                                    "hint": "只有一个 Emby 时可留空；多个实例时建议明确选择。",
+                                    "persistent-hint": True,
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VSelect",
+                                "props": {
+                                    "model": "collection_artwork_scope",
+                                    "label": "处理范围",
+                                    "items": [
+                                        {"title": "全部现有合集", "value": "all"},
+                                        {"title": "指定媒体库中的合集", "value": "libraries"},
+                                        {"title": "指定合集", "value": "collections"},
+                                    ],
+                                    "item-title": "title",
+                                    "item-value": "value",
+                                    "variant": "outlined",
+                                    "hint": "范围只影响读取和刷新图片，不会改变合集成员。",
+                                    "persistent-hint": True,
+                                },
+                            }
+                        ],
+                    },
+                    self._form_col(
+                        "collection_artwork_overwrite_poster",
+                        "覆盖已有 poster",
+                        "关闭时已有 poster 会跳过；建议先关闭确认候选，再按需打开。",
+                        6,
+                    ),
+                    self._form_col(
+                        "collection_artwork_overwrite_logo",
+                        "覆盖已有 Logo",
+                        "关闭时已有 Logo 会跳过；poster 和 Logo 独立判断。",
+                        6,
+                    ),
+                ],
+            },
+            self._library_select(
+                "collection_artwork_libraries",
+                "指定媒体库",
+                "仅在处理范围选择“指定媒体库中的合集”时使用。",
+                collection_library_items,
+            ),
+            {
+                "component": "VCol",
+                "props": {"cols": 12},
+                "content": [
+                    {
+                        "component": "VSelect",
+                        "props": {
+                            "model": "collection_artwork_collections",
+                            "label": "指定合集",
+                            "items": collection_items,
+                            "item-title": "title",
+                            "item-value": "value",
+                            "multiple": True,
+                            "chips": True,
+                            "closable-chips": True,
+                            "variant": "outlined",
+                            "hint": "仅在处理范围选择“指定合集”时使用；列表来自 Emby 现有 BoxSet。",
+                            "persistent-hint": True,
+                            "no-data-text": "未读取到现有 Emby 合集，请先检查实例连接。",
+                        },
+                    }
+                ],
+            },
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "success",
+                    "variant": "tonal",
+                    "title": "当前图片优先级",
+                    "text": self._collection_priority_text(),
+                    "class": "mt-2",
+                },
+            },
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "text": "合集图片会分别为 poster 和 Logo 选择候选；上传后还会重新读取 Emby ImageTags 验证，成功不只看 HTTP 状态码。",
+                    "class": "mt-3",
+                },
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mt-4"},
+                "content": [
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "d-flex flex-wrap align-center ga-3"},
+                        "content": [
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "primary",
+                                    "variant": "elevated",
+                                    "prepend-icon": "mdi-image-sync-outline",
+                                },
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/EmbyMediaImageManager/collection-artwork/scan",
+                                        "method": "POST",
+                                    }
+                                },
+                                "text": "开始刷新合集图片",
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "warning",
+                                    "variant": "tonal",
+                                    "prepend-icon": "mdi-stop-circle-outline",
+                                },
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/EmbyMediaImageManager/collection-artwork/cancel",
+                                        "method": "POST",
+                                    }
+                                },
+                                "text": "取消任务",
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-body-2 text-medium-emphasis"},
+                                "text": "任务进度、成功/失败/跳过数量和每个合集的回读结果可在插件状态页查看。",
+                            },
+                        ],
+                    }
                 ],
             },
         ]
@@ -665,8 +1038,8 @@ class EmbyMediaImageManager(_PluginBase):
                         "props": {
                             "type": "info",
                             "variant": "tonal",
-                            "title": "实时与审计各管各的",
-                            "text": "实时刮削面向全部新入库媒体；周期审计面向少量需要补中文图片的外语库。两套媒体库选择互不影响。",
+                            "title": "实时处理、存量检查、合集图片各管各的",
+                            "text": "实时刮削面向新入库媒体；存量图片检查面向少量外语库；合集图片只处理已有 BoxSet 的封面和徽标。三套范围互不影响。",
                             "class": "mb-4",
                         },
                     },
@@ -676,7 +1049,7 @@ class EmbyMediaImageManager(_PluginBase):
                             self._form_col(
                                 "enabled",
                                 "启用插件",
-                                "总开关；关闭后不会接收事件或运行审计。",
+                                "总开关；关闭后不会接收事件或运行存量检查。",
                                 12,
                             ),
                             {
@@ -695,7 +1068,7 @@ class EmbyMediaImageManager(_PluginBase):
                                             "chips": True,
                                             "closable-chips": True,
                                             "variant": "outlined",
-                                            "hint": "留空接收全部 Emby 实例；选择后同时限制实时事件和审计刷新目标。",
+                                            "hint": "留空接收全部 Emby 实例；选择后同时限制实时事件和存量检查刷新目标。",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -704,7 +1077,7 @@ class EmbyMediaImageManager(_PluginBase):
                             self._form_col(
                                 "movie_enabled",
                                 "处理电影",
-                                "同时应用于实时刮削和周期审计。",
+                                "同时应用于实时刮削和存量图片检查。",
                                 6,
                             ),
                             self._form_col(
@@ -738,7 +1111,15 @@ class EmbyMediaImageManager(_PluginBase):
                                     "value": "audit",
                                     "prepend-icon": "mdi-calendar-search-outline",
                                 },
-                                "text": "周期审计",
+                                "text": "存量图片检查",
+                            },
+                            {
+                                "component": "VTab",
+                                "props": {
+                                    "value": "collection",
+                                    "prepend-icon": "mdi-image-multiple-outline",
+                                },
+                                "text": "合集图片",
                             },
                         ],
                     },
@@ -755,6 +1136,11 @@ class EmbyMediaImageManager(_PluginBase):
                                 "component": "VWindowItem",
                                 "props": {"value": "audit"},
                                 "content": audit_content,
+                            },
+                            {
+                                "component": "VWindowItem",
+                                "props": {"value": "collection"},
+                                "content": collection_content,
                             },
                         ],
                     },
@@ -777,7 +1163,7 @@ class EmbyMediaImageManager(_PluginBase):
                                                 "props": {
                                                     "class": "text-body-2 text-medium-emphasis mb-3"
                                                 },
-                                                "text": "媒体库选择之外的统一排除项，同时应用于实时刮削和周期审计；通常可以留空。",
+                                                "text": "媒体库选择之外的统一排除项，同时应用于实时刮削和存量图片检查；通常可以留空。",
                                             },
                                             self._path_field(
                                                 "exclude_paths",
@@ -832,6 +1218,668 @@ class EmbyMediaImageManager(_PluginBase):
                 ],
             }
         ], defaults
+
+    @staticmethod
+    def _response_payload(response: Any) -> Any:
+        """兼容 requests 响应和测试桩，安全取出 JSON。"""
+        if response is None:
+            return None
+        try:
+            return response.json() if hasattr(response, "json") else response
+        except Exception:
+            return None
+
+    @staticmethod
+    def _response_ok(response: Any) -> bool:
+        """判断 HTTP 响应是否为成功状态。"""
+        return bool(response) and getattr(response, "status_code", 200) in (200, 201, 204)
+
+    def _load_collection_boxsets(self, service: Any) -> List[dict]:
+        """读取现有 BoxSet；这个方法绝不创建或修改合集。"""
+        instance = getattr(service, "instance", None) if service else None
+        if not instance or not hasattr(instance, "get_data"):
+            return []
+        response = instance.get_data(
+            url=(
+                "[HOST]emby/Users/[USER]/Items?Recursive=true&"
+                "IncludeItemTypes=BoxSet&Fields=ProviderIds,ImageTags,LibraryId,"
+                "ParentId,TopParentId,Name&Limit=100000&api_key=[APIKEY]"
+            )
+        )
+        if not self._response_ok(response):
+            raise RuntimeError(
+                f"读取 Emby 合集失败：HTTP {getattr(response, 'status_code', '无响应')}"
+            )
+        payload = self._response_payload(response)
+        items = payload.get("Items", []) if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            raise RuntimeError("读取 Emby 合集失败：响应缺少 Items 列表")
+        return [item for item in items if isinstance(item, dict)]
+
+    @staticmethod
+    def _collection_tmdb_id(item: Optional[dict]) -> str:
+        """从 Emby BoxSet 的 ProviderIds 中兼容提取 TMDB 合集 ID。"""
+        if not isinstance(item, dict):
+            return ""
+        providers = item.get("ProviderIds") or item.get("provider_ids") or {}
+        if not isinstance(providers, dict):
+            providers = {}
+        for key in ("Tmdb", "TMDB", "tmdb", "TmdbCollection", "tmdb_collection"):
+            value = providers.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+        for key in ("Tmdb", "TMDB", "tmdb", "TmdbCollectionId"):
+            value = item.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+        return ""
+
+    def _load_collection_members(self, service: Any, boxset_id: str) -> List[dict]:
+        """只读查询合集成员，用于“指定媒体库”范围判断，不写入成员。"""
+        if not boxset_id:
+            return []
+        instance = getattr(service, "instance", None) if service else None
+        if not instance or not hasattr(instance, "get_data"):
+            return []
+        response = instance.get_data(
+            url=(
+                f"[HOST]emby/Users/[USER]/Items?ParentId={boxset_id}&Recursive=true&"
+                "IncludeItemTypes=Movie,Series&Fields=LibraryId,ParentId,TopParentId,"
+                "Path,Name&Limit=100000&api_key=[APIKEY]"
+            )
+        )
+        if not self._response_ok(response):
+            return []
+        payload = self._response_payload(response)
+        items = payload.get("Items", []) if isinstance(payload, dict) else payload
+        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+    def _collection_matches_libraries(
+        self, server_name: str, service: Any, boxset: dict, selected: List[str]
+    ) -> bool:
+        """按合集字段或只读成员关系判断合集是否属于所选媒体库。"""
+        if not selected:
+            return False
+        selected_ids = set()
+        selected_keys = set()
+        for item in selected:
+            raw = str(item or "").strip()
+            selected_server, separator, selected_id = raw.partition("::")
+            if separator:
+                if selected_server and selected_server != server_name:
+                    continue
+                if selected_id:
+                    selected_ids.add(selected_id)
+                    selected_keys.add(raw)
+            elif raw:
+                # 兼容旧配置直接保存媒体库 ID 的情况。
+                selected_ids.add(raw)
+                selected_keys.add(self._library_key(server_name, raw))
+        selected_ids.discard("")
+        catalog = self._load_library_catalog()
+        selected_names = {
+            str((catalog.get(item) or {}).get("name") or "").casefold()
+            for item in selected_keys
+            if item in catalog and catalog[item].get("server") == server_name
+        }
+        direct_values = {
+            str(boxset.get(field) or "").strip()
+            for field in ("LibraryId", "TopParentId", "ParentId")
+        }
+        if selected_ids.intersection(direct_values):
+            return True
+        member_ids = self._load_collection_members(
+            service, str(boxset.get("Id") or boxset.get("id") or "")
+        )
+        instance = getattr(service, "instance", None) if service else None
+        for member in member_ids:
+            values = {
+                str(member.get(field) or "").strip()
+                for field in ("LibraryId", "TopParentId", "ParentId")
+            }
+            if selected_ids.intersection(values):
+                return True
+            names = {
+                str(member.get(field) or "").strip().casefold()
+                for field in ("LibraryName", "TopParentName")
+            }
+            if selected_names.intersection(names):
+                return True
+            member_id = str(member.get("Id") or member.get("id") or "").strip()
+            if member_id and instance and hasattr(instance, "get_data"):
+                # 某些 Emby 版本的成员列表不给 LibraryId，只能通过祖先库判断。
+                try:
+                    response = instance.get_data(
+                        url=f"[HOST]emby/Items/{member_id}/Ancestors?api_key=[APIKEY]"
+                    )
+                    ancestors = self._response_payload(response)
+                    if isinstance(ancestors, dict):
+                        ancestors = ancestors.get("Items") or ancestors.get("Ancestors") or []
+                    for ancestor in ancestors or []:
+                        if not isinstance(ancestor, dict):
+                            continue
+                        ancestor_id = str(ancestor.get("Id") or ancestor.get("id") or "")
+                        ancestor_name = str(
+                            ancestor.get("Name") or ancestor.get("name") or ""
+                        ).casefold()
+                        if ancestor_id in selected_ids or ancestor_name in selected_names:
+                            return True
+                except Exception as err:
+                    logger.debug("读取合集成员媒体库祖先失败：%s", err)
+        # 最后兼容没有成员字段的 Emby：直接从所选库的条目 CollectionIds 反查。
+        if instance and hasattr(instance, "get_data"):
+            for library_id in selected_ids:
+                try:
+                    response = instance.get_data(
+                        url=(
+                            f"[HOST]emby/Users/[USER]/Items?ParentId={library_id}"
+                            "&Recursive=true&IncludeItemTypes=Movie,Series"
+                            "&Fields=CollectionIds&Limit=100000&api_key=[APIKEY]"
+                        )
+                    )
+                    payload = self._response_payload(response)
+                    items = payload.get("Items", []) if isinstance(payload, dict) else payload
+                    for item in items or []:
+                        collection_ids = item.get("CollectionIds") or item.get("collection_ids") or []
+                        if not isinstance(collection_ids, list):
+                            collection_ids = [collection_ids]
+                        if str(boxset.get("Id") or boxset.get("id") or "") in {
+                            str(value) for value in collection_ids
+                        }:
+                            return True
+                except Exception as err:
+                    logger.debug("按媒体库条目反查合集失败：%s", err)
+        return False
+
+    def _request_json(
+        self, url: str, params: Optional[dict] = None, timeout: int = 20
+    ) -> dict:
+        """发起外部图片 API 请求并统一返回字典。"""
+        request_cls = RequestUtils
+        if request_cls is None:
+            from app.utils.http import RequestUtils as request_cls
+        kwargs = {
+            "proxies": getattr(settings, "PROXY", None),
+            "timeout": timeout,
+        }
+        user_agent = getattr(settings, "NORMAL_USER_AGENT", None)
+        if user_agent:
+            kwargs["ua"] = user_agent
+        try:
+            response = request_cls(**kwargs).get_res(url, params=params or {})
+            if not response or getattr(response, "status_code", 200) != 200:
+                return {}
+            payload = self._response_payload(response)
+            return payload if isinstance(payload, dict) else {}
+        except Exception as err:
+            logger.warning("请求合集图片候选失败：%s - %s", url, err)
+            return {}
+
+    def _query_collection_tmdb(
+        self, collection_id: str
+    ) -> Tuple[dict, dict]:
+        """获取合集详情和图片，显式保留当前优先级需要的语言候选。"""
+        domain = str(getattr(settings, "TMDB_API_DOMAIN", "api.themoviedb.org")).rstrip("/")
+        api_key = str(getattr(settings, "TMDB_API_KEY", "") or "")
+        detail = self._request_json(
+            f"https://{domain}/3/collection/{collection_id}",
+            {"api_key": api_key, "language": "zh-CN"},
+        )
+        images = self._request_json(
+            f"https://{domain}/3/collection/{collection_id}/images",
+            {
+                "api_key": api_key,
+                "language": "zh-CN",
+                "include_image_language": self.COLLECTION_IMAGE_LANGUAGES,
+            },
+        )
+        return detail, images
+
+    def _query_collection_fanart(self, collection_id: str, detail: Optional[dict] = None) -> dict:
+        """查询 Fanart 候选。
+
+        Fanart 的公开 v3 接口主要按电影 ID 提供图片；部分部署提供
+        ``collections`` 路由，因此先尝试合集路由，再兼容电影路由，任何
+        失败都只会让该来源没有候选，不影响 TMDB 选图。
+        """
+        api_key = str(getattr(settings, "FANART_API_KEY", "") or "")
+        if not api_key:
+            return {}
+        for query_type in ("collections",):
+            payload = self._request_json(
+                f"https://webservice.fanart.tv/v3/{query_type}/{collection_id}",
+                {"api_key": api_key},
+                timeout=30,
+            )
+            if payload:
+                return normalize_fanart_payload(payload)
+        # Fanart 官方 v3 没有稳定的合集路由时，按 TMDB 合集成员的电影 ID
+        # 聚合候选，仍然只用于挑选图片，不会修改合集成员。
+        merged: Dict[str, Dict[str, List[dict]]] = {
+            "chinese": {"poster": [], "logo": []},
+            "english": {"poster": [], "logo": []},
+        }
+        part_ids = []
+        for part in (detail or {}).get("parts") or []:
+            if isinstance(part, dict) and part.get("id"):
+                part_ids.append(str(part["id"]))
+        for movie_id in part_ids[:20]:
+            payload = self._request_json(
+                f"https://webservice.fanart.tv/v3/movies/{movie_id}",
+                {"api_key": api_key},
+                timeout=30,
+            )
+            normalized = normalize_fanart_payload(payload)
+            for group in merged:
+                for kind in merged[group]:
+                    seen = {
+                        str(item.get("url")) for item in merged[group][kind] if item.get("url")
+                    }
+                    for item in normalized[group][kind]:
+                        if str(item.get("url")) not in seen:
+                            merged[group][kind].append(item)
+                            seen.add(str(item.get("url")))
+        return merged
+
+    @staticmethod
+    def _collection_image_url(path: str) -> str:
+        """转换 TMDB 相对图片路径为原图地址。"""
+        if str(path).startswith("http"):
+            return str(path)
+        builder = getattr(settings, "TMDB_IMAGE_URL", None)
+        if callable(builder):
+            return str(builder(path, "original"))
+        return f"https://image.tmdb.org/t/p/original{path}"
+
+    @staticmethod
+    def _collection_source_language(detail: Optional[dict]) -> str:
+        """从合集详情或其电影分段推断 TMDB 源语言。"""
+        if not isinstance(detail, dict):
+            return ""
+        direct = str(detail.get("original_language") or "").strip()
+        if direct:
+            return direct
+        languages = [
+            str(part.get("original_language") or "").strip()
+            for part in detail.get("parts") or []
+            if isinstance(part, dict) and part.get("original_language")
+        ]
+        if not languages:
+            return ""
+        # 合集可能跨语言；仅在所有成员一致时使用源语言层，避免误选。
+        return languages[0] if len(set(languages)) == 1 else ""
+
+    def _collection_job(self) -> dict:
+        """读取合集图片任务状态，并以当前线程事实修正 busy。"""
+        job = self.get_data(self.DATA_COLLECTION_JOB) or {}
+        if not isinstance(job, dict):
+            job = {}
+        worker = getattr(self, "_collection_worker", None)
+        busy = bool(worker and worker.is_alive())
+        job["busy"] = busy
+        if busy:
+            job["cancel_requested"] = bool(
+                getattr(self, "_collection_stop_event", None)
+                and self._collection_stop_event.is_set()
+            )
+        elif job.get("running"):
+            job["running"] = False
+        return job
+
+    def _persist_collection_config(self) -> None:
+        """把合集图片字段写回插件配置，兼容设置页保存后的新旧字段。"""
+        try:
+            current = self.get_config() or {}
+            if not isinstance(current, dict):
+                current = {}
+            current.update(
+                {
+                    "collection_artwork_server": self._collection_server,
+                    "collection_artwork_scope": self._collection_scope,
+                    "collection_artwork_libraries": self._collection_libraries,
+                    "collection_artwork_collections": self._collection_ids,
+                    "collection_artwork_overwrite_poster": self._collection_overwrite_poster,
+                    "collection_artwork_overwrite_logo": self._collection_overwrite_logo,
+                }
+            )
+            self.update_config(current)
+        except Exception as err:
+            logger.debug("保存合集图片配置快照失败：%s", err)
+
+    def _set_collection_job(self, **updates: Any) -> dict:
+        """更新并持久化合集图片任务状态。"""
+        with getattr(self, "_collection_lock", threading.RLock()):
+            job = self._collection_job()
+            job.update(updates)
+            job["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            self.save_data(self.DATA_COLLECTION_JOB, job)
+            return job
+
+    def api_collection_artwork_status(self) -> schemas.Response:
+        """返回合集图片任务进度和最近处理明细。"""
+        return schemas.Response(success=True, data=self._collection_job())
+
+    def api_start_collection_artwork_scan(
+        self, payload: Optional[dict] = Body(default=None)
+    ) -> schemas.Response:
+        """启动一次互斥的合集图片刷新任务。"""
+        if not self._enabled:
+            return schemas.Response(success=False, message="请先启用插件")
+        payload = payload if isinstance(payload, dict) else {}
+        server_name, service = self._resolve_collection_service(payload.get("server"))
+        if not service:
+            return schemas.Response(success=False, message="请选择可用的 Emby 服务")
+        scope = str(payload.get("scope") or self._collection_scope or "all").lower()
+        if scope not in {"all", "libraries", "collections"}:
+            return schemas.Response(success=False, message="合集图片处理范围无效")
+        selected_libraries = self._dedupe_values(
+            payload.get("libraries")
+            if "libraries" in payload
+            else self._collection_libraries
+        )
+        selected_ids = self._dedupe_values(
+            payload.get("collections")
+            if "collections" in payload
+            else self._collection_ids
+        )
+        if scope == "all":
+            selected_libraries = []
+            selected_ids = []
+        if scope == "libraries" and not selected_libraries:
+            return schemas.Response(success=False, message="请选择至少一个媒体库")
+        if scope == "collections" and not selected_ids:
+            return schemas.Response(success=False, message="请选择至少一个合集")
+        overwrite_poster = bool(
+            payload.get("overwrite_poster", self._collection_overwrite_poster)
+        )
+        overwrite_logo = bool(
+            payload.get("overwrite_logo", self._collection_overwrite_logo)
+        )
+        self._collection_server = server_name
+        self._collection_scope = scope
+        self._collection_libraries = selected_libraries
+        self._collection_ids = selected_ids
+        self._collection_overwrite_poster = overwrite_poster
+        self._collection_overwrite_logo = overwrite_logo
+        self._persist_collection_config()
+        with self._collection_lock:
+            worker = getattr(self, "_collection_worker", None)
+            if worker and worker.is_alive():
+                return schemas.Response(success=False, message="合集图片任务正在运行")
+            self._collection_stop_event.clear()
+            run_id = uuid4().hex[:12]
+            self._set_collection_job(
+                running=True,
+                busy=True,
+                run_id=run_id,
+                phase="starting",
+                progress=0,
+                current=0,
+                total=0,
+                success=0,
+                failed=0,
+                skipped=0,
+                poster_success=0,
+                logo_success=0,
+                details=[],
+                error="",
+                message="正在启动合集图片刷新",
+                started_at=datetime.now().isoformat(timespec="seconds"),
+            )
+            self._collection_worker = threading.Thread(
+                target=self._collection_artwork_worker,
+                args=(
+                    server_name,
+                    service,
+                    scope,
+                    selected_libraries,
+                    selected_ids,
+                    overwrite_poster,
+                    overwrite_logo,
+                ),
+                daemon=True,
+                name=f"{self.__class__.__name__}-collection-artwork",
+            )
+            self._collection_worker.start()
+        return schemas.Response(success=True, message="合集图片刷新任务已启动", data=self._collection_job())
+
+    def api_cancel_collection_artwork(self) -> schemas.Response:
+        """请求取消合集图片后台任务。"""
+        worker = getattr(self, "_collection_worker", None)
+        if not worker or not worker.is_alive():
+            return schemas.Response(success=False, message="当前没有运行中的合集图片任务")
+        self._collection_stop_event.set()
+        self._set_collection_job(
+            cancel_requested=True, phase="cancelling", message="正在取消合集图片任务"
+        )
+        return schemas.Response(success=True, message="已请求取消合集图片任务")
+
+    def _collection_artwork_worker(
+        self,
+        server_name: str,
+        service: Any,
+        scope: str,
+        selected_libraries: List[str],
+        selected_ids: List[str],
+        overwrite_poster: bool,
+        overwrite_logo: bool,
+    ) -> None:
+        """读取现有合集并逐项刷新 poster/logo，上传后做 ImageTags 回读校验。"""
+        errors: List[str] = []
+        details: List[dict] = []
+        success = failed = skipped = poster_success = logo_success = 0
+        try:
+            boxsets = self._load_collection_boxsets(service)
+            targets: List[dict] = []
+            for boxset in boxsets:
+                boxset_id = str(boxset.get("Id") or boxset.get("id") or "").strip()
+                if not boxset_id:
+                    continue
+                if scope == "collections" and boxset_id not in selected_ids:
+                    continue
+                if scope == "libraries" and not self._collection_matches_libraries(
+                    server_name, service, boxset, selected_libraries
+                ):
+                    continue
+                targets.append(boxset)
+            total = len(targets)
+            self._set_collection_job(
+                phase="refreshing", total=total, current=0, progress=0,
+                message=f"已读取 {total} 个现有合集",
+            )
+            for index, boxset in enumerate(targets, start=1):
+                if self._collection_stop_event.is_set():
+                    break
+                boxset_id = str(boxset.get("Id") or boxset.get("id") or "")
+                name = str(boxset.get("Name") or boxset_id)
+                row = {
+                    "id": boxset_id,
+                    "name": name,
+                    "tmdb_id": self._collection_tmdb_id(boxset),
+                    "status": "skipped",
+                    "poster": None,
+                    "logo": None,
+                    "message": "",
+                }
+                try:
+                    tmdb_id = row["tmdb_id"]
+                    if not tmdb_id:
+                        row["message"] = "缺少 TMDB 合集 ID"
+                        skipped += 1
+                    else:
+                        detail, tmdb_images = self._query_collection_tmdb(tmdb_id)
+                        fanart_images = self._query_collection_fanart(tmdb_id, detail)
+                        source_language = self._collection_source_language(detail)
+                        selected = select_collection_images(
+                            tmdb_images,
+                            fanart_images,
+                            self._collection_priority(),
+                            source_language=source_language,
+                            image_url=self._collection_image_url,
+                        )
+                        row["poster"] = self._collection_selection_summary(selected.get("poster"))
+                        row["logo"] = self._collection_selection_summary(selected.get("logo"))
+                        current = boxset
+                        if not (current.get("ImageTags") or current.get("image_tags")):
+                            current = self._load_collection_item(service, boxset_id) or current
+                        tags = current.get("ImageTags") or current.get("image_tags") or {}
+                        changed = False
+                        skipped_types = 0
+                        for image_type, key, overwrite in (
+                            ("Primary", "poster", overwrite_poster),
+                            ("Logo", "logo", overwrite_logo),
+                        ):
+                            candidate = selected.get(key)
+                            if not candidate:
+                                skipped_types += 1
+                                continue
+                            if tags.get(image_type) and not overwrite:
+                                row[key]["status"] = "skipped"
+                                row[key]["verification"] = "已有图片，按设置跳过"
+                                skipped_types += 1
+                                continue
+                            result = self._upload_collection_image(
+                                service, boxset_id, image_type, candidate["url"]
+                            )
+                            row[key].update(result)
+                            changed = True
+                            if image_type == "Primary":
+                                poster_success += 1
+                            else:
+                                logo_success += 1
+                        if changed:
+                            success += 1
+                            row["status"] = "success"
+                            row["message"] = "至少一种图片已上传并回读验证"
+                        else:
+                            skipped += 1
+                            row["message"] = "没有需要更新的图片候选"
+                except Exception as err:
+                    failed += 1
+                    row["status"] = "failed"
+                    row["message"] = str(err)
+                    errors.append(f"{name}（TMDB {row['tmdb_id'] or '无'}）：{err}")
+                    logger.warning("刷新合集图片失败：%s - %s", name, err, exc_info=True)
+                details.append(row)
+                details = details[-100:]
+                self._set_collection_job(
+                    phase="refreshing",
+                    current=index,
+                    total=total,
+                    progress=round(index * 100 / max(total, 1)),
+                    success=success,
+                    failed=failed,
+                    skipped=skipped,
+                    poster_success=poster_success,
+                    logo_success=logo_success,
+                    details=details,
+                    error="\n".join(errors[-20:]),
+                    message=f"正在处理合集 {index}/{total}：{name}",
+                )
+            cancelled = self._collection_stop_event.is_set()
+            phase = "cancelled" if cancelled else ("partial" if errors else "done")
+            self._set_collection_job(
+                running=False,
+                busy=False,
+                cancel_requested=False,
+                phase=phase,
+                progress=100 if not cancelled else self._collection_job().get("progress", 0),
+                success=success,
+                failed=failed,
+                skipped=skipped,
+                poster_success=poster_success,
+                logo_success=logo_success,
+                details=details,
+                error="\n".join(errors[-20:]),
+                message=(
+                    "合集图片刷新已取消"
+                    if cancelled
+                    else f"合集图片刷新完成：成功 {success}，跳过 {skipped}，失败 {failed}"
+                ),
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+            )
+        except Exception as err:
+            logger.error("合集图片后台任务异常：%s", err, exc_info=True)
+            self._set_collection_job(
+                running=False,
+                busy=False,
+                cancel_requested=False,
+                phase="cancelled" if self._collection_stop_event.is_set() else "failed",
+                message="合集图片任务已取消" if self._collection_stop_event.is_set() else "合集图片任务失败",
+                error="" if self._collection_stop_event.is_set() else str(err),
+                details=details,
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+            )
+        finally:
+            with getattr(self, "_collection_lock", threading.RLock()):
+                if getattr(self, "_collection_worker", None) is threading.current_thread():
+                    self._collection_worker = None
+
+    @staticmethod
+    def _collection_selection_summary(selection: Optional[dict]) -> Optional[dict]:
+        """把选择器结果压缩成可直接展示/持久化的来源摘要。"""
+        if not selection:
+            return None
+        return {
+            "source": selection.get("source"),
+            "language": selection.get("language"),
+            "priority_key": selection.get("priority_key"),
+            "priority_label": selection.get("priority_label"),
+            "status": "pending",
+        }
+
+    def _load_collection_item(self, service: Any, item_id: str) -> dict:
+        """读取单个合集的图片标签。"""
+        instance = getattr(service, "instance", None) if service else None
+        if not instance or not hasattr(instance, "get_data"):
+            return {}
+        response = instance.get_data(
+            url=f"[HOST]emby/Users/[USER]/Items/{item_id}?Fields=ImageTags,ProviderIds&api_key=[APIKEY]"
+        )
+        payload = self._response_payload(response)
+        return payload if isinstance(payload, dict) else {}
+
+    def _upload_collection_image(
+        self, service: Any, item_id: str, image_type: str, image_url: str
+    ) -> dict:
+        """下载并上传图片，随后回读 ImageTags 确认 Emby 已接受。"""
+        request_cls = RequestUtils
+        if request_cls is None:
+            from app.utils.http import RequestUtils as request_cls
+        image = request_cls(
+            proxies=getattr(settings, "PROXY", None), timeout=30
+        ).get_res(image_url)
+        if not image or getattr(image, "status_code", 0) != 200 or not getattr(image, "content", None):
+            raise RuntimeError(f"下载 {image_type} 图片失败")
+        content_type = (getattr(image, "headers", {}) or {}).get("Content-Type") or "image/jpeg"
+        instance = getattr(service, "instance", None) if service else None
+        if not instance or not hasattr(instance, "post_data"):
+            raise RuntimeError("Emby 实例不支持图片上传")
+        upload_url = f"[HOST]emby/Items/{item_id}/Images/{image_type}?api_key=[APIKEY]"
+        # 不同 Emby 版本/适配器对图片体的约定不同：优先尝试插件生态中使用的
+        # Base64 文本体，失败后回退到官方二进制体；两种方式都必须通过回读校验。
+        payloads = [
+            (
+                base64.b64encode(image.content).decode("ascii"),
+                # Emby 通过 MIME 类型判断图片扩展名，body 则是 Base64 文本。
+                {"Content-Type": content_type},
+            ),
+            (image.content, {"Content-Type": content_type}),
+        ]
+        last_status: Any = "无响应"
+        for data, headers in payloads:
+            response = instance.post_data(url=upload_url, data=data, headers=headers)
+            last_status = getattr(response, "status_code", "无响应")
+            if not self._response_ok(response):
+                continue
+            verified = self._load_collection_item(service, item_id)
+            tags = verified.get("ImageTags") or verified.get("image_tags") or {}
+            if tags.get(image_type):
+                return {
+                    "status": "uploaded",
+                    "verification": "Emby ImageTags 回读成功",
+                }
+        raise RuntimeError(f"上传 {image_type} 后回读 ImageTags 未确认（HTTP {last_status}）")
 
     @staticmethod
     def _library_select(model: str, label: str, hint: str, items: List[dict]) -> dict:
@@ -951,9 +1999,10 @@ class EmbyMediaImageManager(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回简洁的运行状态与审计结果页面。"""
+        """返回实时、存量检查与合集图片任务状态页面。"""
         with getattr(self, "_lock", threading.RLock()):
             pending_count = len(getattr(self, "_pending", {}))
+        collection_job = self._collection_job()
         states = self.get_data(self.DATA_STATES) or {}
         if not isinstance(states, dict):
             states = {}
@@ -969,9 +2018,9 @@ class EmbyMediaImageManager(_PluginBase):
             else "实时库：全部"
         )
         audit_scope = (
-            f"审计库 {len(self._audit_libraries)} 个"
+            f"检查库 {len(self._audit_libraries)} 个"
             if self._audit_libraries
-            else "审计库：未选择"
+            else "检查库：未选择"
         )
         enabled_text = "运行中" if self._enabled else "已停用"
         status_color = "success" if self._enabled else "grey"
@@ -1007,7 +2056,7 @@ class EmbyMediaImageManager(_PluginBase):
                                     {
                                         "component": "VChip",
                                         "props": {"variant": "tonal"},
-                                        "text": f"审计 {'开启' if self._audit_enabled else '关闭'}",
+                                        "text": f"存量检查 {'开启' if self._audit_enabled else '关闭'}",
                                     },
                                     {
                                         "component": "VChip",
@@ -1018,6 +2067,14 @@ class EmbyMediaImageManager(_PluginBase):
                                         "component": "VChip",
                                         "props": {"variant": "tonal"},
                                         "text": audit_scope,
+                                    },
+                                    {
+                                        "component": "VChip",
+                                        "props": {"variant": "tonal"},
+                                        "text": (
+                                            f"合集图片{'运行中' if collection_job.get('running') else '空闲'}"
+                                            f" · {collection_job.get('success', 0)} 成功"
+                                        ),
                                     },
                                     {"component": "VSpacer"},
                                     {
@@ -1050,10 +2107,16 @@ class EmbyMediaImageManager(_PluginBase):
                                 "warning",
                             ),
                             self._stat_card(
-                                "审计记录",
+                                "存量检查记录",
                                 len(states),
                                 "mdi-folder-search-outline",
                                 "info",
+                            ),
+                            self._stat_card(
+                                "合集图片成功",
+                                collection_job.get("success", 0),
+                                "mdi-image-check-outline",
+                                "success",
                             ),
                         ],
                     },
@@ -1063,13 +2126,145 @@ class EmbyMediaImageManager(_PluginBase):
                             "type": "info" if not self._audit_running else "warning",
                             "variant": "tonal",
                             "title": "最近运行",
-                            "text": f"实时：{self._last_realtime_result}（{self._last_realtime_at or '—'}）\n审计：{self._last_audit_result}（{self._last_audit_at or '—'}）",
+                            "text": f"实时：{self._last_realtime_result}（{self._last_realtime_at or '—'}）\n存量检查：{self._last_audit_result}（{self._last_audit_at or '—'}）",
                             "class": "mt-2 white-space-pre-line",
                         },
                     },
+                    self._collection_status_card(collection_job),
                 ],
             }
         ]
+
+    @classmethod
+    def _collection_status_card(cls, job: dict) -> dict:
+        """渲染合集图片进度及最近逐合集结果。"""
+        details = job.get("details") if isinstance(job, dict) else []
+        details = details if isinstance(details, list) else []
+        cards = []
+        for row in details[-20:]:
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "skipped")
+            color = {"success": "success", "failed": "error", "skipped": "warning"}.get(
+                status, "info"
+            )
+            poster = row.get("poster") or {}
+            logo = row.get("logo") or {}
+            def artwork_text(value: Any) -> str:
+                if not value:
+                    return "无候选"
+                source = value.get("source") or "未知来源"
+                language = value.get("language") or "未知语言"
+                verification = value.get("verification") or value.get("status") or "未处理"
+                return f"{source} / {language} · {verification}"
+
+            cards.append(
+                {
+                    "component": "VCard",
+                    "props": {"variant": "tonal", "class": "mb-2"},
+                    "content": [
+                        {
+                            "component": "VCardText",
+                            "content": [
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-subtitle-2 font-weight-bold"},
+                                    "text": f"{row.get('name') or '未命名合集'} · TMDB {row.get('tmdb_id') or '无'}",
+                                },
+                                {
+                                    "component": "div",
+                                    "props": {"class": "text-caption text-medium-emphasis mt-1"},
+                                    "text": f"poster：{artwork_text(poster)}；Logo：{artwork_text(logo)}",
+                                },
+                                {
+                                    "component": "VChip",
+                                    "props": {"size": "small", "color": color, "variant": "tonal", "class": "mt-2"},
+                                    "text": row.get("message") or status,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            )
+        total = int(job.get("total") or 0)
+        current = int(job.get("current") or 0)
+        progress = int(job.get("progress") or 0)
+        content: List[dict] = [
+            {
+                "component": "VCardTitle",
+                "text": "合集图片任务",
+            },
+            {
+                "component": "VCardActions",
+                "content": [
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "primary",
+                            "variant": "tonal",
+                            "prepend-icon": "mdi-image-sync-outline",
+                        },
+                        "events": {
+                            "click": {
+                                "api": "plugin/EmbyMediaImageManager/collection-artwork/scan",
+                                "method": "POST",
+                            }
+                        },
+                        "text": "开始刷新合集图片",
+                    },
+                    {
+                        "component": "VBtn",
+                        "props": {
+                            "color": "warning",
+                            "variant": "text",
+                            "prepend-icon": "mdi-stop-circle-outline",
+                        },
+                        "events": {
+                            "click": {
+                                "api": "plugin/EmbyMediaImageManager/collection-artwork/cancel",
+                                "method": "POST",
+                            }
+                        },
+                        "text": "取消",
+                    },
+                ],
+            },
+            {
+                "component": "VCardText",
+                "content": [
+                    {
+                        "component": "VProgressLinear",
+                        "props": {"model-value": progress, "color": "primary", "height": 8, "rounded": True},
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                        "text": f"{job.get('message') or '尚未运行'} · {current}/{total} · poster {job.get('poster_success', 0)} · Logo {job.get('logo_success', 0)} · 跳过 {job.get('skipped', 0)} · 失败 {job.get('failed', 0)}",
+                    },
+                ],
+            },
+        ]
+        if cards:
+            content.append(
+                {
+                    "component": "VExpansionPanels",
+                    "props": {"variant": "accordion"},
+                    "content": [
+                        {
+                            "component": "VExpansionPanel",
+                            "content": [
+                                {"component": "VExpansionPanelTitle", "text": "最近合集结果"},
+                                {"component": "VExpansionPanelText", "content": cards},
+                            ],
+                        }
+                    ],
+                }
+            )
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mt-4 rounded-lg"},
+            "content": content,
+        }
 
     @staticmethod
     def _stat_card(label: str, value: Any, icon: str, color: str) -> dict:
@@ -1116,13 +2311,13 @@ class EmbyMediaImageManager(_PluginBase):
         }
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """注册周期审计服务。"""
+        """注册存量图片检查服务。"""
         if not self._enabled or not self._audit_enabled:
             return []
         return [
             {
                 "id": "EmbyMediaImageManagerAudit",
-                "name": "Emby媒体图片审计",
+                "name": "Emby媒体图片存量检查",
                 "trigger": CronTrigger.from_crontab(self._audit_cron),
                 "func": self.run_audit,
                 "kwargs": {},
@@ -1130,10 +2325,22 @@ class EmbyMediaImageManager(_PluginBase):
         ]
 
     def stop_service(self) -> None:
-        """停止延迟任务并通知进行中的审计尽快退出。"""
+        """停止延迟任务，并通知存量检查/合集图片任务尽快退出。"""
         stop_event = getattr(self, "_stop_event", None)
         if stop_event:
             stop_event.set()
+        collection_stop_event = getattr(self, "_collection_stop_event", None)
+        if collection_stop_event:
+            collection_stop_event.set()
+        collection_worker = getattr(self, "_collection_worker", None)
+        if (
+            collection_worker
+            and collection_worker.is_alive()
+            and collection_worker is not threading.current_thread()
+        ):
+            collection_worker.join(timeout=3)
+        if collection_worker and not collection_worker.is_alive():
+            self._collection_worker = None
         lock = getattr(self, "_lock", None)
         if not lock:
             return
@@ -1281,27 +2488,27 @@ class EmbyMediaImageManager(_PluginBase):
         audit_lock = self._audit_lock
         stop_event = self._stop_event
         if not audit_lock.acquire(blocking=False):
-            logger.warning("图片审计仍在运行，本次计划已跳过")
+            logger.warning("存量图片检查仍在运行，本次计划已跳过")
             return
         self._audit_running = True
         scanned = fixed = waiting = failed = 0
         skip_reason = ""
         states = self.get_data(self.DATA_STATES) or {}
         if not isinstance(states, dict):
-            logger.warning("审计状态数据格式异常，已重建为空状态")
+            logger.warning("存量检查状态数据格式异常，已重建为空状态")
             states = {}
         try:
             roots = self._audit_roots(stop_event)
             if not roots:
-                skip_reason = "未配置媒体库或审计目录，未执行扫描"
-                logger.warning("未配置媒体库或审计目录，跳过图片审计")
+                skip_reason = "未配置媒体库或检查目录，未执行扫描"
+                logger.warning("未配置媒体库或检查目录，跳过存量图片检查")
                 return
             for root_path, root_servers in roots:
                 if stop_event.is_set():
                     break
                 if not root_path.exists():
                     failed += 1
-                    logger.warning("审计路径不存在：%s", root_path)
+                    logger.warning("存量检查路径不存在：%s", root_path)
                     continue
                 for media_path in self._discover_media_paths(root_path, stop_event):
                     if stop_event.is_set():
@@ -1345,12 +2552,12 @@ class EmbyMediaImageManager(_PluginBase):
                             }
                             waiting += 1
                             logger.info(
-                                "审计未发现简体图片，仅记录等待：%s", media_path
+                                "存量检查未发现简体图片，仅记录等待：%s", media_path
                             )
                     except Exception as err:
                         failed += 1
                         logger.warning(
-                            "审计失败：%s - %s", media_path, err, exc_info=True
+                            "存量图片检查失败：%s - %s", media_path, err, exc_info=True
                         )
                     if scanned % 25 == 0:
                         self.save_data(self.DATA_STATES, states)
@@ -1531,7 +2738,7 @@ class EmbyMediaImageManager(_PluginBase):
 
     @staticmethod
     def _state_key(path: Path) -> str:
-        """生成适合跨次审计复用的路径键。"""
+        """生成适合跨次存量检查复用的路径键。"""
         return str(path).replace("\\", "/").rstrip("/").casefold()
 
     @staticmethod
@@ -1552,7 +2759,7 @@ class EmbyMediaImageManager(_PluginBase):
             return cron
         except (TypeError, ValueError) as err:
             logger.warning(
-                "审计计划无效：%r（%s），已使用默认值 %s",
+                "存量图片检查计划无效：%r（%s），已使用默认值 %s",
                 cron,
                 err,
                 cls.DEFAULT_AUDIT_CRON,
